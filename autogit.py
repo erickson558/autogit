@@ -1,20 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-Git Helper GUI – v0.0.3
-- GUI Tkinter con pipeline Git/gh no bloqueante
-- Config persistente en config.json (junto al .py/.exe)
-- log.txt con timestamp
-- Autostart/autocierre con countdown (countdown visible a la derecha de la barra de estado)
-- Menú y atajos estilo Windows (Ctrl+R / Ctrl+D / Ctrl+Q / F1), About
-- Bump de versión 0.0.1 en cambios de config o del propio código
-- Mantiene todas las funciones de v0.0.2
+Git Helper GUI – v0.0.4
+- Barra de estado visible desde el arranque (con zona de countdown a la derecha)
+- Corrección de acentos/ñ en logs: decodificación UTF-8 de la salida de git/gh
+- Mantiene pipeline Git/gh no bloqueante, config.json, log.txt, atajos y About
 
-Requisitos en el sistema:
-- Git instalado y en PATH
-- GitHub CLI (gh) instalado y autenticado: gh auth login
+Requisitos:
+- Git y GitHub CLI (gh) instalados en PATH
+- Autenticado una vez: gh auth login
 """
 
-import os, sys, json, hashlib, threading, time, datetime, queue, traceback, subprocess
+import os, sys, json, hashlib, threading, datetime, queue, traceback, subprocess
 
 try:
     import tkinter as tk
@@ -31,7 +27,7 @@ def app_dir():
 CONFIG_PATH = os.path.join(app_dir(), "config.json")
 LOG_PATH    = os.path.join(app_dir(), "log.txt")
 
-# ---------- Utilidades de log / json / versión ----------
+# ---------- Utilidades ----------
 def log_line(msg):
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with open(LOG_PATH, "a", encoding="utf-8") as f:
@@ -53,6 +49,7 @@ def safe_write_json(path, data):
 
 def file_hash(path):
     try:
+        import hashlib
         h = hashlib.sha256()
         with open(path, "rb") as f:
             for chunk in iter(lambda: f.read(8192), b""): h.update(chunk)
@@ -71,11 +68,11 @@ def bump_version(v):
 DEFAULT_CONFIG = {
     "version": INITIAL_VERSION,
     "last_code_hash": "",
-    "window_geometry": "1000x620+100+100",
+    "window_geometry": "1000x640+100+100",
     "autostart": False,
     "autoclose_enabled": False,
     "autoclose_seconds": 60,
-    "status_text": "",
+    "status_text": "Listo.",
     "shortcuts_enabled": True,
 
     # Campos Git GUI
@@ -85,7 +82,7 @@ DEFAULT_CONFIG = {
     "create_readme_if_missing": True
 }
 
-# ---------- Diálogo About ----------
+# ---------- About ----------
 class AboutDialog(tk.Toplevel):
     def __init__(self, master, version):
         super().__init__(master)
@@ -153,10 +150,8 @@ class App(tk.Tk):
         menubar = tk.Menu(self, tearoff=0)
         self.config(menu=menubar)
 
-        # Menú Aplicación (sin duplicar aceleradores en label)
         m_app = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Aplicación", menu=m_app, underline=0)
-
         m_app.add_command(label="Ejecutar pipeline", underline=0,
                           accelerator="Ctrl+R", command=self._start_pipeline)
         m_app.add_command(label="Detener", underline=0,
@@ -165,7 +160,6 @@ class App(tk.Tk):
         m_app.add_command(label="Salir", underline=0,
                           accelerator="Ctrl+Q", command=self.on_close)
 
-        # Menú Ayuda
         m_help = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Ayuda", menu=m_help, underline=0)
         m_help.add_command(label="About", underline=0,
@@ -246,22 +240,20 @@ class App(tk.Tk):
         sb = ttk.Scrollbar(logf, orient="vertical", command=self.txt_log.yview); sb.pack(side="right", fill="y")
         self.txt_log.configure(yscrollcommand=sb.set)
 
-        # --- Barra de estado con dos zonas ---
-        status = ttk.Frame(self, style="TFrame")
+        # --- Barra de estado (visible siempre) ---
+        status = tk.Frame(self, bg="#0A0E12", bd=1, relief="sunken", height=24)
         status.pack(side="bottom", fill="x")
+        status.pack_propagate(False)  # evita que colapse por falta de contenido
 
-        # Mensaje de estado (izquierda)
+        # Mensaje (izquierda)
         self.status_var = tk.StringVar(value=self.cfg.get("status_text","Listo."))
         lbl_status = ttk.Label(status, textvariable=self.status_var, style="Status.TLabel")
-        lbl_status.pack(side="left", padx=10, pady=4)
+        lbl_status.pack(side="left", padx=10)
 
         # Contador (derecha)
         self.countdown_var = tk.StringVar(value="")
         lbl_count = ttk.Label(status, textvariable=self.countdown_var, style="Status.TLabel")
-        lbl_count.pack(side="right", padx=10, pady=4)
-
-        # Autodetect repo si vacío
-        if not self.repo_name_var.get(): self._autodetect_repo_name()
+        lbl_count.pack(side="right", padx=10)
 
     # ---------- Shortcuts / About ----------
     def _bind_shortcuts(self):
@@ -333,13 +325,13 @@ class App(tk.Tk):
             try: self.after_cancel(self.countdown_job)
             except: pass
             self.countdown_job = None
-        self.countdown_var.set("")  # limpiar solo el contador (no el mensaje)
+        self.countdown_var.set("")  # solo limpia contador
 
     def _tick_countdown(self):
         if not self.autoclose_var.get():
             self._cancel_autoclose()
             return
-        self.countdown_var.set("Auto-cierre: {} s".format(self.autoclose_remaining))
+        self.countdown_var.set(f"Auto-cierre: {self.autoclose_remaining} s")
         if self.autoclose_remaining <= 0:
             self.countdown_var.set("Auto-cierre: 0 s")
             self.on_close()
@@ -384,7 +376,7 @@ class App(tk.Tk):
             pass
         self.after(120, self._poll_worker_queue)
 
-    # ---------- Helpers de subprocess ----------
+    # ---------- Helpers de subprocess (UTF-8) ----------
     def _exe_exists(self, name):
         for p in os.environ.get("PATH","").split(os.pathsep):
             full=os.path.join(p, name + (".exe" if os.name=="nt" else ""))
@@ -392,12 +384,15 @@ class App(tk.Tk):
         return False
 
     def _run_cmd(self, args, cwd, stream=True):
+        """Ejecuta comando con stdout en UTF-8 (evita mojibake)."""
         if not self.running: return 1
         try:
-            p = subprocess.Popen(args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            p = subprocess.Popen(args, cwd=cwd,
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                 text=True, encoding="utf-8", errors="replace")
             if stream:
                 for line in iter(p.stdout.readline, ""):
-                    if line: self.worker_queue.put(("log", line.rstrip()))
+                    if line: self.worker_queue.put(("log", line.rstrip("\r\n")))
                     if not self.running:
                         pass
                 p.wait()
@@ -419,7 +414,9 @@ class App(tk.Tk):
 
     def _remote_url(self, path):
         try:
-            out = subprocess.check_output(["git","remote","get-url","origin"], cwd=path, text=True, stderr=subprocess.DEVNULL).strip()
+            out = subprocess.check_output(["git","remote","get-url","origin"], cwd=path,
+                                          text=True, encoding="utf-8", errors="replace",
+                                          stderr=subprocess.DEVNULL).strip()
             return out
         except: return ""
 
@@ -517,7 +514,9 @@ class App(tk.Tk):
 
     def _detect_github_user(self):
         try:
-            out = subprocess.check_output(["gh","api","user","-q",".login"], text=True, stderr=subprocess.DEVNULL)
+            out = subprocess.check_output(["gh","api","user","-q",".login"],
+                                          text=True, encoding="utf-8", errors="replace",
+                                          stderr=subprocess.DEVNULL)
             user = out.strip()
             if user: self.worker_queue.put(("log", f"Usuario GitHub: {user}"))
             return user
