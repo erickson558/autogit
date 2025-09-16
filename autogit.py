@@ -1,19 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-Git Helper GUI – v0.0.2
+Git Helper GUI – v0.0.3
 - GUI Tkinter con pipeline Git/gh no bloqueante
-- Config persistente en config.json
+- Config persistente en config.json (junto al .py/.exe)
 - log.txt con timestamp
-- Autostart/autocierre con countdown
-- Menú, atajos, About, barra de estado, log visual
+- Autostart/autocierre con countdown (countdown visible a la derecha de la barra de estado)
+- Menú y atajos estilo Windows (Ctrl+R / Ctrl+D / Ctrl+Q / F1), About
 - Bump de versión 0.0.1 en cambios de config o del propio código
+- Mantiene todas las funciones de v0.0.2
 
 Requisitos en el sistema:
 - Git instalado y en PATH
 - GitHub CLI (gh) instalado y autenticado: gh auth login
 """
 
-import os, sys, json, hashlib, threading, time, datetime, queue, traceback, shlex, subprocess
+import os, sys, json, hashlib, threading, time, datetime, queue, traceback, subprocess
 
 try:
     import tkinter as tk
@@ -151,27 +152,24 @@ class App(tk.Tk):
     def _build_menu(self):
         menubar = tk.Menu(self, tearoff=0)
         self.config(menu=menubar)
-    
-        # Menú Aplicación
+
+        # Menú Aplicación (sin duplicar aceleradores en label)
         m_app = tk.Menu(menubar, tearoff=0)
-        # "underline=0" subraya la primera letra (A) en Windows cuando navegas con Alt
         menubar.add_cascade(label="Aplicación", menu=m_app, underline=0)
-    
-        # NO pongas "\tCtrl+R" en el label. Usa 'accelerator' para que se alinee a la derecha
+
         m_app.add_command(label="Ejecutar pipeline", underline=0,
-                        accelerator="Ctrl+R", command=self._start_pipeline)
+                          accelerator="Ctrl+R", command=self._start_pipeline)
         m_app.add_command(label="Detener", underline=0,
-                        accelerator="Ctrl+D", command=self._stop_pipeline)
+                          accelerator="Ctrl+D", command=self._stop_pipeline)
         m_app.add_separator()
         m_app.add_command(label="Salir", underline=0,
-                        accelerator="Ctrl+Q", command=self.on_close)
-    
+                          accelerator="Ctrl+Q", command=self.on_close)
+
         # Menú Ayuda
         m_help = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Ayuda", menu=m_help, underline=0)
         m_help.add_command(label="About", underline=0,
-        accelerator="F1", command=self._show_about)
-
+                           accelerator="F1", command=self._show_about)
 
     def _build_widgets(self):
         # Top bar
@@ -228,7 +226,6 @@ class App(tk.Tk):
         e_msg = ttk.Entry(rowD, width=60, textvariable=self.commit_message_var)
         e_msg.pack(side="left", padx=6, fill="x", expand=True)
         e_msg.bind("<KeyRelease>", lambda e: self._on_str_change("commit_message", self.commit_message_var.get()))
-
         self.create_readme_var = tk.BooleanVar(value=self.cfg.get("create_readme_if_missing", True))
         ttk.Checkbutton(rowD, text="Crear README.md si falta",
                         variable=self.create_readme_var,
@@ -249,10 +246,19 @@ class App(tk.Tk):
         sb = ttk.Scrollbar(logf, orient="vertical", command=self.txt_log.yview); sb.pack(side="right", fill="y")
         self.txt_log.configure(yscrollcommand=sb.set)
 
-        # Barra de estado
-        status = ttk.Frame(self, style="TFrame"); status.pack(side="bottom", fill="x")
+        # --- Barra de estado con dos zonas ---
+        status = ttk.Frame(self, style="TFrame")
+        status.pack(side="bottom", fill="x")
+
+        # Mensaje de estado (izquierda)
         self.status_var = tk.StringVar(value=self.cfg.get("status_text","Listo."))
-        ttk.Label(status, textvariable=self.status_var, style="Status.TLabel").pack(side="left", padx=10, pady=4)
+        lbl_status = ttk.Label(status, textvariable=self.status_var, style="Status.TLabel")
+        lbl_status.pack(side="left", padx=10, pady=4)
+
+        # Contador (derecha)
+        self.countdown_var = tk.StringVar(value="")
+        lbl_count = ttk.Label(status, textvariable=self.countdown_var, style="Status.TLabel")
+        lbl_count.pack(side="right", padx=10, pady=4)
 
         # Autodetect repo si vacío
         if not self.repo_name_var.get(): self._autodetect_repo_name()
@@ -263,6 +269,7 @@ class App(tk.Tk):
         self.bind_all("<Control-d>", lambda e: self._stop_pipeline())
         self.bind_all("<Control-q>", lambda e: self.on_close())
         self.bind_all("<F1>",        lambda e: self._show_about())
+
     def _show_about(self): AboutDialog(self, self.cfg.get("version", INITIAL_VERSION))
     def _status(self, txt):
         self.status_var.set(txt); self.cfg["status_text"]=txt; safe_write_json(CONFIG_PATH, self.cfg)
@@ -315,19 +322,30 @@ class App(tk.Tk):
 
     # ---------- Countdown ----------
     def _schedule_autoclose(self):
-        self._cancel_autoclose(); secs=int(self.cfg.get("autoclose_seconds",60)); secs=1 if secs<1 else secs
-        self.autoclose_remaining=secs; self._tick_countdown()
+        self._cancel_autoclose()
+        secs = int(self.cfg.get("autoclose_seconds", 60))
+        if secs < 1: secs = 1
+        self.autoclose_remaining = secs
+        self._tick_countdown()
+
     def _cancel_autoclose(self):
-        if self.countdown_job: 
+        if self.countdown_job is not None:
             try: self.after_cancel(self.countdown_job)
             except: pass
-        self.countdown_job=None
-        self._status(self.cfg.get("status_text","Listo."))
+            self.countdown_job = None
+        self.countdown_var.set("")  # limpiar solo el contador (no el mensaje)
+
     def _tick_countdown(self):
-        if not self.autoclose_var.get(): return
-        self.status_var.set(f"Auto-cierre en {self.autoclose_remaining} s…")
-        if self.autoclose_remaining<=0: self.on_close(); return
-        self.autoclose_remaining-=1; self.countdown_job=self.after(1000,self._tick_countdown)
+        if not self.autoclose_var.get():
+            self._cancel_autoclose()
+            return
+        self.countdown_var.set("Auto-cierre: {} s".format(self.autoclose_remaining))
+        if self.autoclose_remaining <= 0:
+            self.countdown_var.set("Auto-cierre: 0 s")
+            self.on_close()
+            return
+        self.autoclose_remaining -= 1
+        self.countdown_job = self.after(1000, self._tick_countdown)
 
     # ---------- Pipeline control ----------
     def _start_pipeline(self):
@@ -351,7 +369,6 @@ class App(tk.Tk):
         t.start()
 
     def _stop_pipeline(self):
-        # Señal suave: solo marca running=False; los comandos en curso terminarán
         if not self.running: self._status("No hay proceso en ejecución."); return
         self.running=False; self._append_log("Solicitud de detener recibida… (se detiene al finalizar el paso actual)")
 
@@ -359,7 +376,7 @@ class App(tk.Tk):
         try:
             while True:
                 kind, payload = self.worker_queue.get_nowait()
-                if kind=="log":   self._append_log(payload)
+                if kind=="log":    self._append_log(payload)
                 elif kind=="stat": self._status(payload)
                 elif kind=="done":
                     self.running=False; self.btn_run.config(state="normal"); self.btn_stop.config(state="disabled")
@@ -369,17 +386,12 @@ class App(tk.Tk):
 
     # ---------- Helpers de subprocess ----------
     def _exe_exists(self, name):
-        # equivalente simple a "where"
         for p in os.environ.get("PATH","").split(os.pathsep):
             full=os.path.join(p, name + (".exe" if os.name=="nt" else ""))
             if os.path.isfile(full): return True
         return False
 
     def _run_cmd(self, args, cwd, stream=True):
-        """
-        Ejecuta comando de forma segura (sin shell), captura y envía al log.
-        args: list[str]
-        """
         if not self.running: return 1
         try:
             p = subprocess.Popen(args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -387,7 +399,6 @@ class App(tk.Tk):
                 for line in iter(p.stdout.readline, ""):
                     if line: self.worker_queue.put(("log", line.rstrip()))
                     if not self.running:
-                        # No matamos el proceso a la fuerza para evitar corrupción; dejamos que termine
                         pass
                 p.wait()
                 return p.returncode
@@ -452,30 +463,26 @@ class App(tk.Tk):
                 for args, label in steps:
                     if self._run_cmd(args, cwd=project_path)!=0:
                         self.worker_queue.put(("log", f"ERROR en paso: {label}")); self.worker_queue.put(("done",None)); return
-                # gh repo create
+
                 self.worker_queue.put(("log", f"Creando repo remoto: {repo_name} (public)…"))
                 rc = self._run_cmd(["gh","repo","create",repo_name,"--public","--source",".","--remote","origin"], cwd=project_path)
                 if rc!=0:
                     self.worker_queue.put(("log","No se pudo crear con '--source'; intentando creación simple…"))
                     rc2 = self._run_cmd(["gh","repo","create",repo_name,"--public"], cwd=project_path)
                     if rc2==0:
-                        # asegurar origin
                         if user: self._ensure_origin(project_path, user, repo_name)
                     else:
                         self.worker_queue.put(("log","ERROR: no se pudo crear el repo remoto.")); self.worker_queue.put(("done",None)); return
 
-                # push inicial
                 if self._run_cmd(["git","push","-u","origin","main"], cwd=project_path)!=0:
                     self.worker_queue.put(("log","ERROR en push inicial. Revisa 'gh auth login' o permisos.")); self.worker_queue.put(("done",None)); return
 
-                # README opcional después del push (fiel a tus pasos)
                 if create_readme:
                     readme_path = os.path.join(project_path, "README.md")
                     if not os.path.exists(readme_path):
                         with open(readme_path,"w",encoding="utf-8") as f:
                             f.write(f"# {repo_name}\n\nProyecto {repo_name}.\n")
                         self.worker_queue.put(("log","README.md creado."))
-
                     self._run_cmd(["git","add","README.md"], cwd=project_path)
                     rc = self._run_cmd(["git","commit","-m","Add README"], cwd=project_path)
                     if rc==0:
@@ -486,17 +493,13 @@ class App(tk.Tk):
                 self.worker_queue.put(("stat","Pipeline inicial completado."))
 
             else:
-                # siguientes commits
                 self.worker_queue.put(("stat","Repo existente: realizando commit/push…"))
-                # asegurar branch main y origin
                 self._run_cmd(["git","branch","-M","main"], cwd=project_path)
                 if user: self._ensure_origin(project_path, user, repo_name)
 
                 self._run_cmd(["git","add","."], cwd=project_path)
-                # verificar si hay staged diff
                 rc = self._run_cmd(["git","diff","--cached","--quiet"], cwd=project_path)
                 if rc!=0:
-                    # hay cambios
                     if self._run_cmd(["git","commit","-m", commit_msg], cwd=project_path)!=0:
                         self.worker_queue.put(("log","ERROR en commit.")); self.worker_queue.put(("done",None)); return
                 else:
