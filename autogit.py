@@ -149,18 +149,29 @@ class App(tk.Tk):
         st.configure("Status.TLabel", background="#0A0E12", foreground="#9FB4C7", font=("Segoe UI", 9))
 
     def _build_menu(self):
-        menubar = tk.Menu(self, tearoff=0); self.config(menu=menubar)
-
+        menubar = tk.Menu(self, tearoff=0)
+        self.config(menu=menubar)
+    
+        # Menú Aplicación
         m_app = tk.Menu(menubar, tearoff=0)
-        m_app.add_command(label="&Ejecutar pipeline\tCtrl+R", accelerator="Ctrl+R", command=self._start_pipeline)
-        m_app.add_command(label="&Detener\tCtrl+D", accelerator="Ctrl+D", command=self._stop_pipeline)
+        # "underline=0" subraya la primera letra (A) en Windows cuando navegas con Alt
+        menubar.add_cascade(label="Aplicación", menu=m_app, underline=0)
+    
+        # NO pongas "\tCtrl+R" en el label. Usa 'accelerator' para que se alinee a la derecha
+        m_app.add_command(label="Ejecutar pipeline", underline=0,
+                        accelerator="Ctrl+R", command=self._start_pipeline)
+        m_app.add_command(label="Detener", underline=0,
+                        accelerator="Ctrl+D", command=self._stop_pipeline)
         m_app.add_separator()
-        m_app.add_command(label="&Salir\tCtrl+Q", accelerator="Ctrl+Q", command=self.on_close)
-        menubar.add_cascade(label="&Aplicación", menu=m_app)
-
+        m_app.add_command(label="Salir", underline=0,
+                        accelerator="Ctrl+Q", command=self.on_close)
+    
+        # Menú Ayuda
         m_help = tk.Menu(menubar, tearoff=0)
-        m_help.add_command(label="&About\tF1", accelerator="F1", command=self._show_about)
-        menubar.add_cascade(label="&Ayuda", menu=m_help)
+        menubar.add_cascade(label="Ayuda", menu=m_help, underline=0)
+        m_help.add_command(label="About", underline=0,
+        accelerator="F1", command=self._show_about)
+
 
     def _build_widgets(self):
         # Top bar
