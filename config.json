@@ -1,0 +1,12 @@
+{
+  "version": "0.0.8",
+  "last_code_hash": "775ed5d171934470e170c05b6c4df1067f1550212897b9623de174c3e56aac77",
+  "window_geometry": "900x520+1816+145",
+  "autostart": true,
+  "autoclose_enabled": true,
+  "autoclose_seconds": 60,
+  "saved_password": "",
+  "status_text": "Inicializando repo (primera vez)…",
+  "shortcuts_enabled": true,
+  "repo_name": "autogit"
+}
