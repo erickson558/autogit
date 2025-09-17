@@ -1,7 +1,7 @@
 {
-  "version": "0.0.16",
-  "last_code_hash": "5a3e7766a2d168665a1fa4c83eb8f68679d02c6adaf2e16be649fa93ea52b295",
-  "window_geometry": "900x574+1816+145",
+  "version": "0.0.17",
+  "last_code_hash": "3d62f19b10b6abded5d487ada80924883b87b873f05664e3e7f115f3da40ad38",
+  "window_geometry": "1600x817+1816+145",
   "autostart": true,
   "autoclose_enabled": true,
   "autoclose_seconds": 60,

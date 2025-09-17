@@ -1,17 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Git Helper GUI – v0.0.7
-- Autenticación configurable: GH CLI / HTTPS+PAT / SSH
-- Campos GUI: Git user.name/email, GitHub user, Token (mostrar/ocultar), guardar token en Credential Manager (Win)
-- Crea repo remoto si no existe (vía gh; con PAT puede loguear gh con el token)
-- Manejo de .git/index.lock (auto-fix y reintento)
-- Sin consolas (CREATE_NO_WINDOW)
-- Autocierre pausado durante pipeline
-- Logs UTF-8
-
-Requisitos:
-- Git en PATH
-- GitHub CLI (gh) en PATH (se usa para crear el repo remoto; con PAT puede autologuearse)
+Git Helper GUI – v0.0.8
+- Guarda en config.json TODOS los campos editables de la GUI (incluye PAT token).
+- Status bar fija y visible siempre (con countdown a la derecha).
+- Mantiene: ocultar consolas, crear repo remoto si no existe, manejo index.lock,
+  autenticación GH/HTTPS+PAT/SSH, autocierre pausado durante pipeline, logs UTF-8.
 """
 
 import os, sys, json, hashlib, threading, datetime, queue, traceback, subprocess
@@ -86,17 +79,17 @@ DEFAULT_CONFIG = {
     "git_user_name": "erickson558",
     "git_user_email": "erickson558@hotmail.com",
 
-    # Autenticación
-    # values: "gh" | "https_pat" | "ssh"
+    # Autenticación: "gh" | "https_pat" | "ssh"
     "auth_method": "gh",
     "github_user": "erickson558",
 
-    # PAT (NO se guarda el token en config)
-    "pat_username": "github",           # puede ser 'github' o tu usuario
+    # HTTPS + PAT (ahora también guardamos el token por petición)
+    "pat_username": "github",
+    "pat_token": "",  # ⚠️ guardado en texto plano por solicitud explícita
     "pat_save_in_credential_manager": True,
 
     # SSH
-    "ssh_key_path": "",                 # opcional, informativo
+    "ssh_key_path": "",
 
     # Commit / flujo
     "commit_message": "Actualización automática",
@@ -148,6 +141,10 @@ class App(tk.Tk):
 
         if self.cfg.get("shortcuts_enabled", True): self._bind_shortcuts()
         self.after(100, self._poll_worker_queue)
+
+        # Si Autoclose ON y no corriendo, arranca countdown visible
+        if self.cfg.get("autoclose_enabled", False):
+            self._schedule_autoclose()
 
         if self.autostart_var.get():
             self._start_pipeline()
@@ -266,15 +263,15 @@ class App(tk.Tk):
 
         ttk.Label(rowE, text="PAT token:").grid(row=1, column=2, sticky="w", padx=(16,6))
         self._pat_shown = False
-        self.pat_token_mem = ""  # NO se guarda en config.json
-        self.pat_token_var = tk.StringVar(value="")
+        self.pat_token_var = tk.StringVar(value=self.cfg.get("pat_token",""))
         self.e_pt = ttk.Entry(rowE, width=30, textvariable=self.pat_token_var, show="•")
         self.e_pt.grid(row=1, column=3, sticky="w", padx=6, pady=6)
-
         def toggle_pat():
             self._pat_shown = not self._pat_shown
             self.e_pt.config(show="" if self._pat_shown else "•")
         ttk.Button(rowE, text="Mostrar", width=10, command=toggle_pat).grid(row=1, column=4, sticky="w", padx=6)
+        # guardado inmediato al escribir
+        self.e_pt.bind("<KeyRelease>", lambda e: self._on_str_change("pat_token", self.pat_token_var.get()))
 
         self.pat_save_var = tk.BooleanVar(value=self.cfg.get("pat_save_in_credential_manager", True))
         ttk.Checkbutton(rowE, text="Guardar token en Credential Manager (Windows)",
@@ -290,7 +287,6 @@ class App(tk.Tk):
         e_sk.bind("<FocusOut>", lambda e: self._on_str_change("ssh_key_path", self.ssh_key_var.get()))
         e_sk.bind("<Return>",   lambda e: self._on_str_change("ssh_key_path", self.ssh_key_var.get()))
         ttk.Button(rowE, text="Examinar…", command=self._browse_ssh_key).grid(row=3, column=3, sticky="w", padx=6)
-
         for i in range(5):
             rowE.grid_columnconfigure(i, weight=1)
 
@@ -321,9 +317,10 @@ class App(tk.Tk):
         sb = ttk.Scrollbar(logf, orient="vertical", command=self.txt_log.yview); sb.pack(side="right", fill="y")
         self.txt_log.configure(yscrollcommand=sb.set)
 
-        # Status bar
+        # Status bar SIEMPRE visible, al final de la ventana
         status = tk.Frame(self, bg="#0A0E12", bd=1, relief="sunken", height=24)
-        status.pack(side="bottom", fill="x"); status.pack_propagate(False)
+        status.pack(side="bottom", fill="x")
+        status.pack_propagate(False)
         self.status_var = tk.StringVar(value=self.cfg.get("status_text","Listo."))
         ttk.Label(status, textvariable=self.status_var, style="Status.TLabel").pack(side="left", padx=10)
         self.countdown_var = tk.StringVar(value="")
@@ -340,7 +337,7 @@ class App(tk.Tk):
     def _status(self, txt):
         self.status_var.set(txt); self.cfg["status_text"]=txt; safe_write_json(CONFIG_PATH, self.cfg)
 
-    # ---------- Config handlers ----------
+    # ---------- Config handlers (GUARDAN TODO) ----------
     def _on_bool_change(self, key, value):
         self.cfg[key]=bool(value); safe_write_json(CONFIG_PATH,self.cfg); self._bump_on_config_change(f"{key}={value}")
         self._status(f"Guardado {key} = {value}")
@@ -358,9 +355,10 @@ class App(tk.Tk):
             self._schedule_autoclose()
 
     def _on_str_change(self, key, value):
-        # NUNCA guardamos el PAT en config: si key == 'pat_token' lo ignoramos
-        if key == "pat_token": return
-        self.cfg[key]=value; safe_write_json(CONFIG_PATH,self.cfg); self._bump_on_config_change(f"{key}=len{len(str(value))}")
+        # A PARTIR DE ESTA VERSIÓN guardamos TODO, incl. 'pat_token' (por petición).
+        self.cfg[key]=value
+        safe_write_json(CONFIG_PATH,self.cfg)
+        self._bump_on_config_change(f"{key}=len{len(str(value))}")
         self._status(f"Guardado {key}")
 
     def _on_project_path_change(self):
@@ -403,7 +401,8 @@ class App(tk.Tk):
         secs = int(self.cfg.get("autoclose_seconds", 60))
         if secs < 1: secs = 1
         self.autoclose_remaining = secs
-        self._tick_countdown()
+        self.countdown_var.set(f"Auto-cierre: {self.autoclose_remaining} s")
+        self.countdown_job = self.after(1000, self._tick_countdown)
 
     def _cancel_autoclose(self):
         if self.countdown_job is not None:
@@ -415,10 +414,10 @@ class App(tk.Tk):
     def _tick_countdown(self):
         if not self.autoclose_var.get():
             self._cancel_autoclose(); return
-        self.countdown_var.set(f"Auto-cierre: {self.autoclose_remaining} s")
+        self.autoclose_remaining -= 1
         if self.autoclose_remaining <= 0:
             self.countdown_var.set("Auto-cierre: 0 s"); self.on_close(); return
-        self.autoclose_remaining -= 1
+        self.countdown_var.set(f"Auto-cierre: {self.autoclose_remaining} s")
         self.countdown_job = self.after(1000, self._tick_countdown)
 
     # ---------- Subprocess helpers (ocultos en Windows) ----------
@@ -539,7 +538,6 @@ class App(tk.Tk):
             return False
 
     def _gh_login_with_token(self, token):
-        """gh auth login --with-token (si no hay sesión); token via stdin."""
         if not self._exe_exists("gh"): return False
         if self._gh_auth_status_ok(): return True
         si, cf = self._startupinfo_flags()
@@ -561,8 +559,7 @@ class App(tk.Tk):
         return rc == 0
 
     def _save_pat_in_credential_manager(self, username, token):
-        """Guarda PAT en Git Credential Manager para https://github.com (Windows)."""
-        if os.name != "nt": 
+        if os.name != "nt":
             self.worker_queue.put(("log","INFO: Guardar token en Credential Manager solo disponible en Windows."))
             return False
         si, cf = self._startupinfo_flags()
@@ -581,7 +578,7 @@ class App(tk.Tk):
             self.worker_queue.put(("log", f"ERROR guardando token: {e}"))
             return False
 
-    # ---------- Pipeline ----------
+    # ---------- Pipeline principal ----------
     def _worker_pipeline(self, project_path, repo_name, commit_msg, create_readme):
         try:
             self.worker_queue.put(("stat","Verificando herramientas…"))
@@ -596,7 +593,7 @@ class App(tk.Tk):
             method   = self.auth_method_var.get().strip() or "gh"
             gh_user  = self.github_user_var.get().strip()
             pat_user = self.pat_user_var.get().strip() or "github"
-            pat_token= self.pat_token_var.get().strip()  # NO persistimos
+            pat_token= self.pat_token_var.get().strip()
             save_pat = self.pat_save_var.get()
 
             # identidad git
@@ -637,17 +634,15 @@ class App(tk.Tk):
             origin_url = self._build_origin(method, gh_user, repo_name)
             self._ensure_origin(project_path, origin_url)
 
-            # Si PAT: opcionalmente guardar en Credential Manager
+            # Si PAT: guardar en Credential Manager (opcional) + loguear gh si hace falta para crear remoto
             if method == "https_pat" and pat_token:
                 if save_pat: self._save_pat_in_credential_manager(pat_user, pat_token)
-                # y además loguear gh con token si no hay sesión (para crear repo remoto)
                 if self._exe_exists("gh"): self._gh_login_with_token(pat_token)
 
             # Crear repo remoto si no existe
             if self._exe_exists("gh") and gh_user and repo_name and not self._remote_exists(gh_user, repo_name):
                 if not self._create_remote(repo_name):
                     self.worker_queue.put(("log","ERROR: no se pudo crear el repo remoto.")); self.worker_queue.put(("done",None)); return
-                # re-asegurar origin (por si gh creó bajo otra URL)
                 origin_url = self._build_origin(method, gh_user, repo_name)
                 self._ensure_origin(project_path, origin_url)
 
@@ -669,7 +664,6 @@ class App(tk.Tk):
             # push
             rc = self._run_cmd(["git","push","-u","origin","main"], cwd=project_path)
             if rc != 0:
-                # último intento: si remoto no existe, créalo y reintenta
                 if self._exe_exists("gh") and gh_user and repo_name and not self._remote_exists(gh_user, repo_name):
                     if self._create_remote(repo_name):
                         self._ensure_origin(project_path, origin_url)
@@ -677,8 +671,8 @@ class App(tk.Tk):
                 if rc != 0:
                     self.worker_queue.put(("log","ERROR en push. Revisa remoto/credenciales.")); self.worker_queue.put(("done",None)); return
 
-            # README opcional (solo primera vez o cuando falte)
-            if create_readme:
+            # README opcional
+            if self.cfg.get("create_readme_if_missing", True):
                 readme_path = os.path.join(project_path, "README.md")
                 if not os.path.exists(readme_path):
                     with open(readme_path,"w",encoding="utf-8") as f:
