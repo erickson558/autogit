@@ -1,13 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Git Helper GUI – v0.0.4
-- Barra de estado visible desde el arranque (con zona de countdown a la derecha)
-- Corrección de acentos/ñ en logs: decodificación UTF-8 de la salida de git/gh
-- Mantiene pipeline Git/gh no bloqueante, config.json, log.txt, atajos y About
-
-Requisitos:
-- Git y GitHub CLI (gh) instalados en PATH
-- Autenticado una vez: gh auth login
+Git Helper GUI – v0.0.5
+Cambios:
+- (Windows) Oculta ventanas de Git/CMD para todos los subprocess (CREATE_NO_WINDOW + STARTF_USESHOWWINDOW).
+- Autocierre: se PAUSA durante el pipeline y el countdown inicia al terminar.
+- Silencia salida de 'git rev-parse' (evita 'true' en log).
+- Mantiene: GUI no bloqueante, config.json, log.txt UTF-8, statusbar con countdown a la derecha, menú y atajos, pipeline git/gh.
 """
 
 import os, sys, json, hashlib, threading, datetime, queue, traceback, subprocess
@@ -49,7 +47,6 @@ def safe_write_json(path, data):
 
 def file_hash(path):
     try:
-        import hashlib
         h = hashlib.sha256()
         with open(path, "rb") as f:
             for chunk in iter(lambda: f.read(8192), b""): h.update(chunk)
@@ -240,20 +237,13 @@ class App(tk.Tk):
         sb = ttk.Scrollbar(logf, orient="vertical", command=self.txt_log.yview); sb.pack(side="right", fill="y")
         self.txt_log.configure(yscrollcommand=sb.set)
 
-        # --- Barra de estado (visible siempre) ---
+        # Status bar
         status = tk.Frame(self, bg="#0A0E12", bd=1, relief="sunken", height=24)
-        status.pack(side="bottom", fill="x")
-        status.pack_propagate(False)  # evita que colapse por falta de contenido
-
-        # Mensaje (izquierda)
+        status.pack(side="bottom", fill="x"); status.pack_propagate(False)
         self.status_var = tk.StringVar(value=self.cfg.get("status_text","Listo."))
-        lbl_status = ttk.Label(status, textvariable=self.status_var, style="Status.TLabel")
-        lbl_status.pack(side="left", padx=10)
-
-        # Contador (derecha)
+        ttk.Label(status, textvariable=self.status_var, style="Status.TLabel").pack(side="left", padx=10)
         self.countdown_var = tk.StringVar(value="")
-        lbl_count = ttk.Label(status, textvariable=self.countdown_var, style="Status.TLabel")
-        lbl_count.pack(side="right", padx=10)
+        ttk.Label(status, textvariable=self.countdown_var, style="Status.TLabel").pack(side="right", padx=10)
 
     # ---------- Shortcuts / About ----------
     def _bind_shortcuts(self):
@@ -270,7 +260,12 @@ class App(tk.Tk):
     def _on_bool_change(self, key, value):
         self.cfg[key]=bool(value); safe_write_json(CONFIG_PATH,self.cfg); self._bump_on_config_change(f"{key}={value}")
         self._status(f"Guardado {key} = {value}")
-        if key=="autoclose_enabled": (self._schedule_autoclose() if value else self._cancel_autoclose())
+        # si activas autoclose mientras hay pipeline corriendo, no disparamos countdown hasta que termine
+        if key=="autoclose_enabled":
+            if value and not self.running:
+                self._schedule_autoclose()
+            else:
+                self._cancel_autoclose()
 
     def _on_int_change(self, key, raw):
         try:
@@ -278,7 +273,7 @@ class App(tk.Tk):
         except: v=DEFAULT_CONFIG.get(key,60)
         self.cfg[key]=v; safe_write_json(CONFIG_PATH,self.cfg); self._bump_on_config_change(f"{key}={v}")
         self._status(f"Guardado {key} = {v}")
-        if key=="autoclose_seconds" and self.autoclose_var.get(): self._schedule_autoclose()
+        if key=="autoclose_seconds" and self.autoclose_var.get() and not self.running: self._schedule_autoclose()
 
     def _on_str_change(self, key, value):
         self.cfg[key]=value; safe_write_json(CONFIG_PATH,self.cfg); self._bump_on_config_change(f"{key}=len{len(value)}")
@@ -303,6 +298,7 @@ class App(tk.Tk):
     def _bump_on_config_change(self, reason=""):
         old=self.cfg.get("version",INITIAL_VERSION); new=bump_version(old)
         self.cfg["version"]=new; safe_write_json(CONFIG_PATH,self.cfg)
+        # nota: no forzamos bump visual aquí para no “parpadear” la UI; opcional:
         self.version_label.config(text=f"Versión: {new}")
         log_line(f"Version bump por cambio de config ({reason}): {old} -> {new}")
 
@@ -325,17 +321,15 @@ class App(tk.Tk):
             try: self.after_cancel(self.countdown_job)
             except: pass
             self.countdown_job = None
-        self.countdown_var.set("")  # solo limpia contador
+        self.countdown_var.set("")
 
     def _tick_countdown(self):
         if not self.autoclose_var.get():
-            self._cancel_autoclose()
-            return
+            self._cancel_autoclose(); return
         self.countdown_var.set(f"Auto-cierre: {self.autoclose_remaining} s")
         if self.autoclose_remaining <= 0:
             self.countdown_var.set("Auto-cierre: 0 s")
-            self.on_close()
-            return
+            self.on_close(); return
         self.autoclose_remaining -= 1
         self.countdown_job = self.after(1000, self._tick_countdown)
 
@@ -354,8 +348,8 @@ class App(tk.Tk):
         self._status("Ejecutando pipeline…")
         self._append_log(f"Iniciando pipeline en: {proj} (repo: {repo})")
 
-        if self.autoclose_var.get(): self._schedule_autoclose()
-        else: self._cancel_autoclose()
+        # IMPORTANTE: NO iniciar countdown durante el pipeline
+        self._cancel_autoclose()
 
         t=threading.Thread(target=self._worker_pipeline, args=(proj,repo,self.commit_message_var.get().strip() or "Actualización automática", self.create_readme_var.get()), daemon=True)
         t.start()
@@ -372,11 +366,26 @@ class App(tk.Tk):
                 elif kind=="stat": self._status(payload)
                 elif kind=="done":
                     self.running=False; self.btn_run.config(state="normal"); self.btn_stop.config(state="disabled")
+                    # countdown SOLO cuando termina (si está activado)
+                    if self.autoclose_var.get():
+                        self._schedule_autoclose()
         except queue.Empty:
             pass
         self.after(120, self._poll_worker_queue)
 
-    # ---------- Helpers de subprocess (UTF-8) ----------
+    # ---------- Helpers de subprocess (Windows: sin ventana) ----------
+    def _startupinfo_flags(self):
+        si = None
+        cf = 0
+        if os.name == "nt":
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            try:
+                cf = subprocess.CREATE_NO_WINDOW  # oculta ventana de consola
+            except AttributeError:
+                cf = 0
+        return si, cf
+
     def _exe_exists(self, name):
         for p in os.environ.get("PATH","").split(os.pathsep):
             full=os.path.join(p, name + (".exe" if os.name=="nt" else ""))
@@ -384,12 +393,16 @@ class App(tk.Tk):
         return False
 
     def _run_cmd(self, args, cwd, stream=True):
-        """Ejecuta comando con stdout en UTF-8 (evita mojibake)."""
+        """Ejecuta comando ocultando ventana en Windows y capturando UTF-8."""
         if not self.running: return 1
+        si, cf = self._startupinfo_flags()
         try:
-            p = subprocess.Popen(args, cwd=cwd,
-                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                 text=True, encoding="utf-8", errors="replace")
+            p = subprocess.Popen(
+                args, cwd=cwd,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace",
+                startupinfo=si, creationflags=cf
+            )
             if stream:
                 for line in iter(p.stdout.readline, ""):
                     if line: self.worker_queue.put(("log", line.rstrip("\r\n")))
@@ -408,15 +421,30 @@ class App(tk.Tk):
             self.worker_queue.put(("log", f"ERROR ejecutando {args}: {e}"))
             return 1
 
+    def _run_check_output(self, args, cwd=None):
+        """check_output con ventana oculta en Windows y UTF-8."""
+        si, cf = self._startupinfo_flags()
+        return subprocess.check_output(
+            args, cwd=cwd, text=True, encoding="utf-8", errors="replace",
+            stderr=subprocess.DEVNULL, startupinfo=si, creationflags=cf
+        )
+
     def _is_git_repo(self, path):
-        rc = self._run_cmd(["git","rev-parse","--is-inside-work-tree"], cwd=path, stream=False)
-        return rc==0
+        # No logueamos la salida; solo evaluamos returncode
+        si, cf = self._startupinfo_flags()
+        try:
+            rc = subprocess.call(
+                ["git","rev-parse","--is-inside-work-tree"], cwd=path,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                startupinfo=si, creationflags=cf
+            )
+            return rc == 0
+        except Exception:
+            return False
 
     def _remote_url(self, path):
         try:
-            out = subprocess.check_output(["git","remote","get-url","origin"], cwd=path,
-                                          text=True, encoding="utf-8", errors="replace",
-                                          stderr=subprocess.DEVNULL).strip()
+            out = self._run_check_output(["git","remote","get-url","origin"], cwd=path).strip()
             return out
         except: return ""
 
@@ -495,6 +523,7 @@ class App(tk.Tk):
                 if user: self._ensure_origin(project_path, user, repo_name)
 
                 self._run_cmd(["git","add","."], cwd=project_path)
+                # ¿hay algo staged?
                 rc = self._run_cmd(["git","diff","--cached","--quiet"], cwd=project_path)
                 if rc!=0:
                     if self._run_cmd(["git","commit","-m", commit_msg], cwd=project_path)!=0:
@@ -514,9 +543,10 @@ class App(tk.Tk):
 
     def _detect_github_user(self):
         try:
+            si, cf = self._startupinfo_flags()
             out = subprocess.check_output(["gh","api","user","-q",".login"],
                                           text=True, encoding="utf-8", errors="replace",
-                                          stderr=subprocess.DEVNULL)
+                                          stderr=subprocess.DEVNULL, startupinfo=si, creationflags=cf)
             user = out.strip()
             if user: self.worker_queue.put(("log", f"Usuario GitHub: {user}"))
             return user
