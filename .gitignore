@@ -10,3 +10,5 @@ node_modules/
 .DS_Store
 Thumbs.db
 autogit.exe
+config_autogit.json
+log_autogit.txt
