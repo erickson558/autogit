@@ -1,12 +1,15 @@
 {
-  "version": "0.0.12",
-  "last_code_hash": "815b5b1a63617fb3ee035b81556d72fd3097d53616dc95e1f2bb899725a37fe9",
+  "version": "0.0.16",
+  "last_code_hash": "5a3e7766a2d168665a1fa4c83eb8f68679d02c6adaf2e16be649fa93ea52b295",
   "window_geometry": "900x574+1816+145",
   "autostart": true,
   "autoclose_enabled": true,
   "autoclose_seconds": 60,
   "saved_password": "",
-  "status_text": "Repo existente: realizando commit/push…",
+  "status_text": "Verificando herramientas…",
   "shortcuts_enabled": true,
-  "repo_name": "autogit"
+  "repo_name": "autogit",
+  "github_user": "erickson558",
+  "git_user_name": "erickson558",
+  "git_user_email": "erickson558@hotmail.com"
 }
