@@ -1,0 +1,22 @@
+{
+  "version": "0.0.5",
+  "last_code_hash": "84f4915d98dc5e1ce066f54da1fc57e969c6b4f79e2812e0eaf982564415f03b",
+  "window_geometry": "1040x720+100+100",
+  "autostart": true,
+  "autoclose_enabled": true,
+  "autoclose_seconds": 60,
+  "status_text": "Verificando herramientas…",
+  "shortcuts_enabled": true,
+  "project_path": "D:\\OneDrive\\Regional\\1 pendientes para analisis\\proyectospython\\autogit",
+  "repo_name": "autogit",
+  "git_user_name": "erickson558",
+  "git_user_email": "erickson558@hotmail.com",
+  "auth_method": "gh",
+  "github_user": "erickson558",
+  "pat_username": "github",
+  "pat_token": "",
+  "pat_save_in_credential_manager": true,
+  "ssh_key_path": "",
+  "commit_message": "Actualización automática",
+  "create_readme_if_missing": true
+}

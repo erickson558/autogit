@@ -21,8 +21,8 @@ INITIAL_VERSION = "0.0.1"
 def app_dir():
     return os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
 
-CONFIG_PATH = os.path.join(app_dir(), "config.json")
-LOG_PATH    = os.path.join(app_dir(), "log.txt")
+CONFIG_PATH = os.path.join(app_dir(), "config_autogit.json")
+LOG_PATH    = os.path.join(app_dir(), "log_autogit.txt")
 
 # ---------- Utilidades ----------
 def log_line(msg):
