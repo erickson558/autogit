@@ -1,13 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-Git Helper GUI – v0.1.1
-- Corrige SyntaxError en definición de clase y saca _append_gitignore_patterns al nivel correcto.
-- Mantiene: limpieza de historial si GH001, .gitignore automático, untrack de config/log/exe,
-  bloqueo de archivos grandes pre-commit, reintentos de push, creación de repo remoto (gh),
-  ejecución sin consolas, status bar con countdown, guardar toda la GUI en config_autogit.json.
+Git Helper GUI – v0.1.2
+- Stash automático antes de reescribir historia (filter-branch); restaura después.
+- Silencia warning de filter-branch (FILTER_BRANCH_SQUELCH_WARNING=1).
+- Evita "pathspec ... did not match" verificando existencia y tracking antes de untrack.
+- Subprocess sin consolas (CREATE_NO_WINDOW), logs UTF-8, statusbar con countdown.
+- Limpieza de historial si GH001 (blobs >100MB): intenta 'git filter-repo', fallback a 'git filter-branch'.
+- Pre-commit: ignora y untrackea archivos > max_file_size_mb y autogit.exe.
+- Reintentos de push con mitigación de timeouts (HTTP/1.1, postBuffer, repack, gc).
+- Crea repo remoto (gh) si no existe; actualiza origin según método (gh/https_pat/ssh).
+- Persistencia completa de parámetros de GUI en config_autogit.json.
 """
 
 import os, sys, json, hashlib, threading, datetime, queue, traceback, subprocess, time
+
 try:
     import tkinter as tk
     from tkinter import ttk, filedialog
@@ -100,10 +106,13 @@ DEFAULT_CONFIG = {
     "force_push_after_purge": True
 }
 
+# .gitignore base (incluye variantes *autogit*)
 GITIGNORE_LINES = [
     "# --- GitHelper default ---",
     "config.json",
     "log.txt",
+    "config_autogit.json",
+    "log_autogit.txt",
     "*.exe",
     "*.pyc",
     "__pycache__/",
@@ -420,14 +429,14 @@ class App(tk.Tk):
             if os.path.isfile(full): return True
         return False
 
-    def _run_cmd(self, args, cwd, stream=True):
+    def _run_cmd(self, args, cwd, stream=True, env=None):
         if not self.running: return 1
         si, cf = self._startupinfo_flags()
         try:
             p = subprocess.Popen(
                 args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace",
-                startupinfo=si, creationflags=cf
+                startupinfo=si, creationflags=cf, env=(env or os.environ.copy())
             )
             if stream:
                 for line in iter(p.stdout.readline, ""):
@@ -442,14 +451,14 @@ class App(tk.Tk):
         except Exception as e:
             self.worker_queue.put(("log", f"ERROR ejecutando {args}: {e}")); return 1
 
-    def _run_cmd_capture(self, args, cwd):
+    def _run_cmd_capture(self, args, cwd, env=None):
         if not self.running: return (1, "")
         si, cf = self._startupinfo_flags()
         try:
             p = subprocess.Popen(
                 args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace",
-                startupinfo=si, creationflags=cf
+                startupinfo=si, creationflags=cf, env=(env or os.environ.copy())
             )
             out, _ = p.communicate()
             if out: self.worker_queue.put(("log", out.strip()))
@@ -458,11 +467,12 @@ class App(tk.Tk):
             txt = f"ERROR ejecutando {args}: {e}"
             self.worker_queue.put(("log", txt)); return (1, txt)
 
-    def _run_check_output(self, args, cwd=None):
+    def _run_check_output(self, args, cwd=None, env=None):
         si, cf = self._startupinfo_flags()
         return subprocess.check_output(
             args, cwd=cwd, text=True, encoding="utf-8", errors="replace",
-            stderr=subprocess.DEVNULL, startupinfo=si, creationflags=cf
+            stderr=subprocess.DEVNULL, startupinfo=si, creationflags=cf,
+            env=(env or os.environ.copy())
         )
 
     # ---------- Git helpers ----------
@@ -535,6 +545,10 @@ class App(tk.Tk):
         rc = self._run_cmd(["gh","repo","create", repo, "--public"], cwd=None)
         return rc == 0
 
+    def _save_pat_in_credential_manager(self, user, token):
+        """Stub opcional: aquí podrías integrar 'cmdkey' o Manager via wincred; dejamos no-op seguro."""
+        self.worker_queue.put(("log", "PAT no se persiste automáticamente (stub)."))
+
     # --- .gitignore / untrack / tamaño ---
     def _ensure_gitignore(self, project_path):
         path = os.path.join(project_path, ".gitignore"); existing = []
@@ -593,6 +607,11 @@ class App(tk.Tk):
     def _untrack_list(self, project_path, relpaths):
         removed = []
         for rel in relpaths:
+            full = os.path.join(project_path, rel)
+            if not os.path.exists(full):
+                continue
+            if not self._is_tracked(project_path, rel):
+                continue
             rc = self._run_cmd(["git","rm","--cached","-f", rel], cwd=project_path)
             if rc == 0: removed.append(rel)
         if removed: self.worker_queue.put(("log", "Untrack: " + ", ".join(removed)))
@@ -612,6 +631,7 @@ class App(tk.Tk):
                     if os.path.getsize(p) > limit:
                         rel = os.path.relpath(p, project_path); big.append(rel)
                 except: pass
+        # proteger autogit.exe explícitamente
         special = "autogit.exe"; sp = os.path.join(project_path, special)
         if os.path.exists(sp):
             rel = os.path.relpath(sp, project_path)
@@ -630,13 +650,48 @@ class App(tk.Tk):
         except Exception:
             return False
 
+    def _worktree_dirty(self, cwd):
+        try:
+            rc1 = subprocess.call(["git","diff","--cached","--quiet"], cwd=cwd,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            rc2 = subprocess.call(["git","diff","--quiet"], cwd=cwd,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            rc3_out = self._run_check_output(["git","ls-files","--others","--exclude-standard"], cwd=cwd)
+            has_untracked = bool((rc3_out or "").strip())
+            return (rc1 != 0) or (rc2 != 0) or has_untracked
+        except Exception:
+            return True
+
+    def _prepare_history_rewrite(self, cwd):
+        """Asegura árbol limpio. Si hay cambios, hace stash -u y devuelve True."""
+        if self._worktree_dirty(cwd):
+            self.worker_queue.put(("log","Working tree sucio: guardando en stash…"))
+            rc = self._run_cmd(["git","stash","push","-u","-m","autogit-temp-stash"], cwd=cwd)
+            return rc == 0
+        return False
+
+    def _restore_after_rewrite(self, cwd, stashed):
+        if stashed:
+            self.worker_queue.put(("log","Restaurando cambios desde stash…"))
+            self._run_cmd(["git","stash","pop"], cwd=cwd)
+
     def _run_filter_branch(self, project_path, paths):
-        """Fallback: git filter-branch (lento)."""
+        """Fallback: git filter-branch (lento pero sin dependencias)."""
+        stashed = self._prepare_history_rewrite(project_path)
+        env = os.environ.copy()
+        env["FILTER_BRANCH_SQUELCH_WARNING"] = "1"
+
         rm_cmd = " && ".join([f"git rm -q -f --cached --ignore-unmatch {p}" for p in paths]) or "echo noop"
-        rc = self._run_cmd(["git","filter-branch","-f","--tree-filter", rm_cmd, "--","--all"], cwd=project_path)
-        if rc != 0: return False
-        self._run_cmd(["git","reflog","expire","--expire=now","--all"], cwd=project_path)
-        self._run_cmd(["git","gc","--prune=now","--aggressive"], cwd=project_path)
+        rc = self._run_cmd(["git","filter-branch","-f","--tree-filter", rm_cmd, "--","--all"],
+                           cwd=project_path, env=env)
+        if rc != 0:
+            self._restore_after_rewrite(project_path, stashed)
+            return False
+
+        self._run_cmd(["git","reflog","expire","--expire=now","--all"], cwd=project_path, env=env)
+        self._run_cmd(["git","gc","--prune=now","--aggressive"], cwd=project_path, env=env)
+
+        self._restore_after_rewrite(project_path, stashed)
         return True
 
     def _purge_history_paths(self, project_path, patterns):
@@ -661,22 +716,27 @@ class App(tk.Tk):
             text = (out or "").lower()
             self.worker_queue.put(("log", f"push intento {i}/{attempts} falló (rc={rc})"))
 
+            # GH001 / Large files
             if any(s in text for s in ["large files detected", "exceeds github's file size limit", "lfs", "gh001"]):
+                # Ignorar en working tree
                 large_now = self._scan_large_files(project_path)
                 if large_now:
                     self._append_gitignore_patterns(project_path, large_now)
                     self._untrack_list(project_path, large_now)
                     self._run_cmd(["git","add",".gitignore"], cwd=project_path)
                     self._run_cmd(["git","commit","--amend","-C","HEAD"], cwd=project_path)
+                # Limpiar HISTORIA
                 purge_patterns = list(set(self.cfg.get("history_purge_patterns", ["autogit.exe"]) + large_now))
                 if not self._purge_history_paths(project_path, purge_patterns):
                     return rc
+                # Force push
                 if self.cfg.get("force_push_after_purge", True):
                     self._run_cmd(["git","push","--force","--prune","--tags",origin,"+refs/heads/*:refs/heads/*"], cwd=project_path)
                     return 0
                 else:
                     continue
 
+            # Timeouts / desconexiones
             if any(s in text for s in [
                 "http 408", "timeout", "timed out", "the remote end hung up unexpectedly",
                 "unexpected disconnect", "operation timed out", "curl 22", "rpc failed"
@@ -755,7 +815,11 @@ class App(tk.Tk):
 
             # .gitignore + untrack básicos
             self._ensure_gitignore(project_path)
-            self._untrack_list(project_path, ["config.json","log.txt"] + ([os.path.basename(sys.executable)] if getattr(sys,'frozen',False) else []))
+            # intenta desindexar variantes bajo control de la app + el exe empacado si aplica
+            exe_name = os.path.basename(sys.executable) if getattr(sys,'frozen',False) else None
+            to_untrack = ["config.json","log.txt","config_autogit.json","log_autogit.txt"]
+            if exe_name: to_untrack.append(exe_name)
+            self._untrack_list(project_path, to_untrack)
 
             # BLOQUE: archivos grandes en working tree (pre-commit)
             large = self._scan_large_files(project_path)
