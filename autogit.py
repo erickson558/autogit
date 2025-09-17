@@ -1,14 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Git Helper GUI – v0.0.8
-- Guarda en config.json TODOS los campos editables de la GUI (incluye PAT token).
-- Status bar fija y visible siempre (con countdown a la derecha).
-- Mantiene: ocultar consolas, crear repo remoto si no existe, manejo index.lock,
-  autenticación GH/HTTPS+PAT/SSH, autocierre pausado durante pipeline, logs UTF-8.
+Git Helper GUI – v0.1.1
+- Corrige SyntaxError en definición de clase y saca _append_gitignore_patterns al nivel correcto.
+- Mantiene: limpieza de historial si GH001, .gitignore automático, untrack de config/log/exe,
+  bloqueo de archivos grandes pre-commit, reintentos de push, creación de repo remoto (gh),
+  ejecución sin consolas, status bar con countdown, guardar toda la GUI en config_autogit.json.
 """
 
-import os, sys, json, hashlib, threading, datetime, queue, traceback, subprocess
-
+import os, sys, json, hashlib, threading, datetime, queue, traceback, subprocess, time
 try:
     import tkinter as tk
     from tkinter import ttk, filedialog
@@ -60,7 +59,7 @@ def bump_version(v):
         return f"{a}.{b}.{c}"
     except: return INITIAL_VERSION
 
-# ---------- Config por defecto ----------
+# ---------- Config ----------
 DEFAULT_CONFIG = {
     "version": INITIAL_VERSION,
     "last_code_hash": "",
@@ -83,9 +82,9 @@ DEFAULT_CONFIG = {
     "auth_method": "gh",
     "github_user": "erickson558",
 
-    # HTTPS + PAT (ahora también guardamos el token por petición)
+    # HTTPS + PAT
     "pat_username": "github",
-    "pat_token": "",  # ⚠️ guardado en texto plano por solicitud explícita
+    "pat_token": "",
     "pat_save_in_credential_manager": True,
 
     # SSH
@@ -93,10 +92,28 @@ DEFAULT_CONFIG = {
 
     # Commit / flujo
     "commit_message": "Actualización automática",
-    "create_readme_if_missing": True
+    "create_readme_if_missing": True,
+
+    # Control grandes / limpieza historia
+    "max_file_size_mb": 95,
+    "history_purge_patterns": ["autogit.exe"],
+    "force_push_after_purge": True
 }
 
-# ---------- About ----------
+GITIGNORE_LINES = [
+    "# --- GitHelper default ---",
+    "config.json",
+    "log.txt",
+    "*.exe",
+    "*.pyc",
+    "__pycache__/",
+    ".venv/",
+    "venv/",
+    "node_modules/",
+    ".DS_Store",
+    "Thumbs.db",
+]
+
 class AboutDialog(tk.Toplevel):
     def __init__(self, master, version):
         super().__init__(master)
@@ -109,13 +126,10 @@ class AboutDialog(tk.Toplevel):
         ttk.Button(frm, text="Cerrar (Esc)", command=self.destroy).pack()
         self.bind("<Escape>", lambda e: self.destroy())
 
-# ---------- App ----------
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_NAME); self.configure(bg="#0B0F14")
-
-        # Cargar config + bump si cambió el código
         self.cfg = safe_read_json(CONFIG_PATH, DEFAULT_CONFIG.copy())
         code_path = sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(__file__)
         h = file_hash(code_path)
@@ -125,11 +139,7 @@ class App(tk.Tk):
             safe_write_json(CONFIG_PATH, self.cfg)
             log_line(f"Version bump por cambio de código: {self.cfg['version']}")
 
-        self._build_style()
-        self._build_menu()
-        self._build_widgets()
-
-        # Restaurar geometría
+        self._build_style(); self._build_menu(); self._build_widgets()
         try: self.geometry(self.cfg.get("window_geometry") or DEFAULT_CONFIG["window_geometry"])
         except: self.geometry(DEFAULT_CONFIG["window_geometry"])
 
@@ -142,12 +152,8 @@ class App(tk.Tk):
         if self.cfg.get("shortcuts_enabled", True): self._bind_shortcuts()
         self.after(100, self._poll_worker_queue)
 
-        # Si Autoclose ON y no corriendo, arranca countdown visible
-        if self.cfg.get("autoclose_enabled", False):
-            self._schedule_autoclose()
-
-        if self.autostart_var.get():
-            self._start_pipeline()
+        if self.cfg.get("autoclose_enabled", False): self._schedule_autoclose()
+        if self.autostart_var.get(): self._start_pipeline()
 
         log_line(f"App iniciada v{self.cfg['version']}")
         self.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -165,8 +171,7 @@ class App(tk.Tk):
         st.configure("Status.TLabel", background="#0A0E12", foreground="#9FB4C7", font=("Segoe UI", 9))
 
     def _build_menu(self):
-        menubar = tk.Menu(self, tearoff=0)
-        self.config(menu=menubar)
+        menubar = tk.Menu(self, tearoff=0); self.config(menu=menubar)
         m_app = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Aplicación", menu=m_app, underline=0)
         m_app.add_command(label="Ejecutar pipeline", accelerator="Ctrl+R", command=self._start_pipeline)
@@ -181,12 +186,10 @@ class App(tk.Tk):
         top = ttk.Frame(self); top.pack(fill="x", padx=16, pady=12)
         ttk.Label(top, text=APP_NAME, font=("Segoe UI Semibold", 14)).pack(side="left")
         self.version_label = ttk.Label(top, text=f"Versión: {self.cfg.get('version', INITIAL_VERSION)}",
-                                       font=("Segoe UI Semibold", 10))
-        self.version_label.pack(side="right")
+                                       font=("Segoe UI Semibold", 10)); self.version_label.pack(side="right")
 
         body = ttk.Frame(self); body.pack(fill="both", expand=True, padx=16, pady=8)
 
-        # Línea A: Autostart / Autocerrar
         rowA = ttk.Frame(body); rowA.pack(fill="x", pady=(2,2))
         self.autostart_var = tk.BooleanVar(value=self.cfg.get("autostart", False))
         ttk.Checkbutton(rowA, text="Autoiniciar pipeline al abrir",
@@ -203,7 +206,6 @@ class App(tk.Tk):
         e_secs.pack(side="left"); e_secs.bind("<FocusOut>", lambda e: self._on_int_change("autoclose_seconds", self.autoclose_secs_var.get()))
         e_secs.bind("<Return>",   lambda e: self._on_int_change("autoclose_seconds", self.autoclose_secs_var.get()))
 
-        # Línea B: Proyecto y repo
         rowB = ttk.Frame(body); rowB.pack(fill="x", pady=(8,4))
         ttk.Label(rowB, text="Ruta del proyecto:").pack(side="left")
         self.project_path_var = tk.StringVar(value=self.cfg.get("project_path", app_dir()))
@@ -222,7 +224,6 @@ class App(tk.Tk):
         e_repo.bind("<Return>",   lambda e: self._on_str_change("repo_name", self.repo_name_var.get()))
         ttk.Button(rowC, text="Autodetectar", command=self._autodetect_repo_name).pack(side="left", padx=(6,0))
 
-        # Línea D: Identidad Git
         rowD = ttk.Frame(body); rowD.pack(fill="x", pady=(8,4))
         ttk.Label(rowD, text="Git user.name:").pack(side="left")
         self.git_user_name_var = tk.StringVar(value=self.cfg.get("git_user_name",""))
@@ -237,7 +238,6 @@ class App(tk.Tk):
         e_ue.bind("<FocusOut>", lambda e: self._on_str_change("git_user_email", self.git_user_email_var.get()))
         e_ue.bind("<Return>",   lambda e: self._on_str_change("git_user_email", self.git_user_email_var.get()))
 
-        # Línea E: Autenticación
         rowE = ttk.LabelFrame(body, text="Autenticación"); rowE.pack(fill="x", pady=(10,6))
         ttk.Label(rowE, text="Método:").grid(row=0, column=0, sticky="w", padx=6, pady=6)
         self.auth_method_var = tk.StringVar(value=self.cfg.get("auth_method","gh"))
@@ -245,7 +245,6 @@ class App(tk.Tk):
                                values=["gh","https_pat","ssh"], width=12)
         cb_auth.grid(row=0, column=1, sticky="w", padx=6, pady=6)
         cb_auth.bind("<<ComboboxSelected>>", lambda e: self._on_str_change("auth_method", self.auth_method_var.get()))
-
         ttk.Label(rowE, text="Usuario GitHub:").grid(row=0, column=2, sticky="w", padx=(16,6))
         self.github_user_var = tk.StringVar(value=self.cfg.get("github_user",""))
         e_ghu = ttk.Entry(rowE, width=22, textvariable=self.github_user_var)
@@ -253,14 +252,12 @@ class App(tk.Tk):
         e_ghu.bind("<FocusOut>", lambda e: self._on_str_change("github_user", self.github_user_var.get()))
         e_ghu.bind("<Return>",   lambda e: self._on_str_change("github_user", self.github_user_var.get()))
 
-        # HTTPS + PAT
         ttk.Label(rowE, text="PAT usuario:").grid(row=1, column=0, sticky="w", padx=6, pady=6)
         self.pat_user_var = tk.StringVar(value=self.cfg.get("pat_username","github"))
         e_pu = ttk.Entry(rowE, width=20, textvariable=self.pat_user_var)
         e_pu.grid(row=1, column=1, sticky="w", padx=6, pady=6)
         e_pu.bind("<FocusOut>", lambda e: self._on_str_change("pat_username", self.pat_user_var.get()))
         e_pu.bind("<Return>",   lambda e: self._on_str_change("pat_username", self.pat_user_var.get()))
-
         ttk.Label(rowE, text="PAT token:").grid(row=1, column=2, sticky="w", padx=(16,6))
         self._pat_shown = False
         self.pat_token_var = tk.StringVar(value=self.cfg.get("pat_token",""))
@@ -270,16 +267,13 @@ class App(tk.Tk):
             self._pat_shown = not self._pat_shown
             self.e_pt.config(show="" if self._pat_shown else "•")
         ttk.Button(rowE, text="Mostrar", width=10, command=toggle_pat).grid(row=1, column=4, sticky="w", padx=6)
-        # guardado inmediato al escribir
         self.e_pt.bind("<KeyRelease>", lambda e: self._on_str_change("pat_token", self.pat_token_var.get()))
-
         self.pat_save_var = tk.BooleanVar(value=self.cfg.get("pat_save_in_credential_manager", True))
         ttk.Checkbutton(rowE, text="Guardar token en Credential Manager (Windows)",
                         variable=self.pat_save_var,
                         command=lambda: self._on_bool_change("pat_save_in_credential_manager", self.pat_save_var.get())
                         ).grid(row=2, column=0, columnspan=3, sticky="w", padx=6, pady=4)
 
-        # SSH
         ttk.Label(rowE, text="Clave SSH (opcional):").grid(row=3, column=0, sticky="w", padx=6, pady=6)
         self.ssh_key_var = tk.StringVar(value=self.cfg.get("ssh_key_path",""))
         e_sk = ttk.Entry(rowE, width=40, textvariable=self.ssh_key_var)
@@ -287,10 +281,8 @@ class App(tk.Tk):
         e_sk.bind("<FocusOut>", lambda e: self._on_str_change("ssh_key_path", self.ssh_key_var.get()))
         e_sk.bind("<Return>",   lambda e: self._on_str_change("ssh_key_path", self.ssh_key_var.get()))
         ttk.Button(rowE, text="Examinar…", command=self._browse_ssh_key).grid(row=3, column=3, sticky="w", padx=6)
-        for i in range(5):
-            rowE.grid_columnconfigure(i, weight=1)
+        for i in range(5): rowE.grid_columnconfigure(i, weight=1)
 
-        # Línea F: Commit + README
         rowF = ttk.Frame(body); rowF.pack(fill="x", pady=(8,4))
         ttk.Label(rowF, text="Mensaje de commit:").pack(side="left")
         self.commit_message_var = tk.StringVar(value=self.cfg.get("commit_message","Actualización automática"))
@@ -303,24 +295,20 @@ class App(tk.Tk):
                         command=lambda: self._on_bool_change("create_readme_if_missing", self.create_readme_var.get())
                         ).pack(side="left", padx=(10,0))
 
-        # Botones
         rowG = ttk.Frame(body); rowG.pack(fill="x", pady=(12,6))
         self.btn_run  = ttk.Button(rowG, text="Ejecutar pipeline (Ctrl+R)", command=self._start_pipeline)
         self.btn_stop = ttk.Button(rowG, text="Detener (Ctrl+D)", command=self._stop_pipeline, state="disabled")
         self.btn_exit = ttk.Button(rowG, text="Salir (Ctrl+Q)", command=self.on_close)
         self.btn_run.pack(side="left"); self.btn_stop.pack(side="left", padx=8); self.btn_exit.pack(side="right")
 
-        # Log visual
         logf = ttk.Frame(body); logf.pack(fill="both", expand=True, pady=(8,8))
         self.txt_log = tk.Text(logf, height=14, bg="#0F1620", fg="#C9D1D9", insertbackground="#C9D1D9", relief="flat", wrap="word")
         self.txt_log.pack(side="left", fill="both", expand=True)
         sb = ttk.Scrollbar(logf, orient="vertical", command=self.txt_log.yview); sb.pack(side="right", fill="y")
         self.txt_log.configure(yscrollcommand=sb.set)
 
-        # Status bar SIEMPRE visible, al final de la ventana
         status = tk.Frame(self, bg="#0A0E12", bd=1, relief="sunken", height=24)
-        status.pack(side="bottom", fill="x")
-        status.pack_propagate(False)
+        status.pack(side="bottom", fill="x"); status.pack_propagate(False)
         self.status_var = tk.StringVar(value=self.cfg.get("status_text","Listo."))
         ttk.Label(status, textvariable=self.status_var, style="Status.TLabel").pack(side="left", padx=10)
         self.countdown_var = tk.StringVar(value="")
@@ -337,7 +325,7 @@ class App(tk.Tk):
     def _status(self, txt):
         self.status_var.set(txt); self.cfg["status_text"]=txt; safe_write_json(CONFIG_PATH, self.cfg)
 
-    # ---------- Config handlers (GUARDAN TODO) ----------
+    # ---------- Config handlers ----------
     def _on_bool_change(self, key, value):
         self.cfg[key]=bool(value); safe_write_json(CONFIG_PATH,self.cfg); self._bump_on_config_change(f"{key}={value}")
         self._status(f"Guardado {key} = {value}")
@@ -355,9 +343,7 @@ class App(tk.Tk):
             self._schedule_autoclose()
 
     def _on_str_change(self, key, value):
-        # A PARTIR DE ESTA VERSIÓN guardamos TODO, incl. 'pat_token' (por petición).
-        self.cfg[key]=value
-        safe_write_json(CONFIG_PATH,self.cfg)
+        self.cfg[key]=value; safe_write_json(CONFIG_PATH,self.cfg)
         self._bump_on_config_change(f"{key}=len{len(str(value))}")
         self._status(f"Guardado {key}")
 
@@ -374,7 +360,7 @@ class App(tk.Tk):
         path = filedialog.askopenfilename(initialdir=os.path.expanduser("~"), title="Selecciona tu clave privada",
                                           filetypes=[("Claves", "*"), ("Todos", "*.*")])
         if path:
-            self.ssh_key_var.set(path); self._on_str_change("ssh_key_path", path)
+            self.ssh_key_var.set(path); self._on_str_change("ssh_key_path", self.ssh_key_var.get())
 
     def _autodetect_repo_name(self):
         p = self.project_path_var.get().strip() or app_dir()
@@ -389,13 +375,12 @@ class App(tk.Tk):
         self.version_label.config(text=f"Versión: {new}")
         log_line(f"Version bump por cambio de config ({reason}): {old} -> {new}")
 
-    # ---------- Log visual ----------
+    # ---------- Log & countdown ----------
     def _append_log(self, txt):
         ts = datetime.datetime.now().strftime("%H:%M:%S")
         self.txt_log.insert("end", f"[{ts}] {txt}\n"); self.txt_log.see("end")
         log_line(txt)
 
-    # ---------- Countdown ----------
     def _schedule_autoclose(self):
         self._cancel_autoclose()
         secs = int(self.cfg.get("autoclose_seconds", 60))
@@ -420,13 +405,11 @@ class App(tk.Tk):
         self.countdown_var.set(f"Auto-cierre: {self.autoclose_remaining} s")
         self.countdown_job = self.after(1000, self._tick_countdown)
 
-    # ---------- Subprocess helpers (ocultos en Windows) ----------
+    # ---------- Subprocess (oculto) ----------
     def _startupinfo_flags(self):
-        si = None
-        cf = 0
+        si = None; cf = 0
         if os.name == "nt":
-            si = subprocess.STARTUPINFO()
-            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            si = subprocess.STARTUPINFO(); si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             try: cf = subprocess.CREATE_NO_WINDOW
             except AttributeError: cf = 0
         return si, cf
@@ -438,33 +421,42 @@ class App(tk.Tk):
         return False
 
     def _run_cmd(self, args, cwd, stream=True):
-        """Ejecuta comando ocultando ventana (Windows) y capturando UTF-8."""
         if not self.running: return 1
         si, cf = self._startupinfo_flags()
         try:
             p = subprocess.Popen(
-                args, cwd=cwd,
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace",
                 startupinfo=si, creationflags=cf
             )
             if stream:
                 for line in iter(p.stdout.readline, ""):
                     if line: self.worker_queue.put(("log", line.rstrip("\r\n")))
-                    if not self.running:
-                        pass
-                p.wait()
-                return p.returncode
+                p.wait(); return p.returncode
             else:
                 out = p.communicate()[0]
                 if out: self.worker_queue.put(("log", out.strip()))
                 return p.returncode
         except FileNotFoundError:
-            self.worker_queue.put(("log", f"ERROR: comando no encontrado: {args[0]}"))
-            return 127
+            self.worker_queue.put(("log", f"ERROR: comando no encontrado: {args[0]}")); return 127
         except Exception as e:
-            self.worker_queue.put(("log", f"ERROR ejecutando {args}: {e}"))
-            return 1
+            self.worker_queue.put(("log", f"ERROR ejecutando {args}: {e}")); return 1
+
+    def _run_cmd_capture(self, args, cwd):
+        if not self.running: return (1, "")
+        si, cf = self._startupinfo_flags()
+        try:
+            p = subprocess.Popen(
+                args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace",
+                startupinfo=si, creationflags=cf
+            )
+            out, _ = p.communicate()
+            if out: self.worker_queue.put(("log", out.strip()))
+            return p.returncode, out
+        except Exception as e:
+            txt = f"ERROR ejecutando {args}: {e}"
+            self.worker_queue.put(("log", txt)); return (1, txt)
 
     def _run_check_output(self, args, cwd=None):
         si, cf = self._startupinfo_flags()
@@ -473,40 +465,29 @@ class App(tk.Tk):
             stderr=subprocess.DEVNULL, startupinfo=si, creationflags=cf
         )
 
+    # ---------- Git helpers ----------
     def _is_git_repo(self, path):
         si, cf = self._startupinfo_flags()
         try:
-            rc = subprocess.call(
-                ["git","rev-parse","--is-inside-work-tree"], cwd=path,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                startupinfo=si, creationflags=cf
-            )
+            rc = subprocess.call(["git","rev-parse","--is-inside-work-tree"], cwd=path,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 startupinfo=si, creationflags=cf)
             return rc == 0
-        except Exception:
-            return False
+        except Exception: return False
 
     def _git_toplevel(self, path):
-        try:
-            out = self._run_check_output(["git","rev-parse","--show-toplevel"], cwd=path).strip()
-            return out
-        except:
-            return ""
+        try: return self._run_check_output(["git","rev-parse","--show-toplevel"], cwd=path).strip()
+        except: return ""
 
-    # ---------- Auth/Remote helpers ----------
     def _remote_url(self, path):
-        try:
-            out = self._run_check_output(["git","remote","get-url","origin"], cwd=path).strip()
-            return out
+        try: return self._run_check_output(["git","remote","get-url","origin"], cwd=path).strip()
         except: return ""
 
     def _build_origin(self, method, github_user, repo):
-        if method == "ssh":
-            return f"git@github.com:{github_user}/{repo}.git"
-        else:
-            return f"https://github.com/{github_user}/{repo}.git"
+        return f"git@github.com:{github_user}/{repo}.git" if method=="ssh" else f"https://github.com/{github_user}/{repo}.git"
 
     def _ensure_origin(self, path, url):
-        current  = self._remote_url(path)
+        current = self._remote_url(path)
         if not current:
             self.worker_queue.put(("log", f"Agregando origin -> {url}"))
             self._run_cmd(["git","remote","add","origin", url], cwd=path)
@@ -522,10 +503,8 @@ class App(tk.Tk):
                                     text=True, encoding="utf-8", errors="replace",
                                     stderr=subprocess.DEVNULL, startupinfo=si, creationflags=cf)
             return True
-        except subprocess.CalledProcessError:
-            return False
-        except Exception:
-            return False
+        except subprocess.CalledProcessError: return False
+        except Exception: return False
 
     def _gh_auth_status_ok(self):
         if not self._exe_exists("gh"): return False
@@ -534,8 +513,7 @@ class App(tk.Tk):
             subprocess.check_output(["gh","auth","status"], text=True, encoding="utf-8", errors="replace",
                                     stderr=subprocess.DEVNULL, startupinfo=si, creationflags=cf)
             return True
-        except Exception:
-            return False
+        except Exception: return False
 
     def _gh_login_with_token(self, token):
         if not self._exe_exists("gh"): return False
@@ -549,8 +527,7 @@ class App(tk.Tk):
             p.communicate(input=token+"\n", timeout=30)
             return p.returncode == 0
         except Exception as e:
-            self.worker_queue.put(("log", f"ERROR gh auth login: {e}"))
-            return False
+            self.worker_queue.put(("log", f"ERROR gh auth login: {e}")); return False
 
     def _create_remote(self, repo):
         if not self._exe_exists("gh"): return False
@@ -558,25 +535,175 @@ class App(tk.Tk):
         rc = self._run_cmd(["gh","repo","create", repo, "--public"], cwd=None)
         return rc == 0
 
-    def _save_pat_in_credential_manager(self, username, token):
-        if os.name != "nt":
-            self.worker_queue.put(("log","INFO: Guardar token en Credential Manager solo disponible en Windows."))
-            return False
-        si, cf = self._startupinfo_flags()
+    # --- .gitignore / untrack / tamaño ---
+    def _ensure_gitignore(self, project_path):
+        path = os.path.join(project_path, ".gitignore"); existing = []
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    existing = [ln.rstrip("\n") for ln in f.readlines()]
+            except: existing=[]
+        merged = existing[:]; changed = False
+        for ln in GITIGNORE_LINES:
+            if ln not in merged: merged.append(ln); changed = True
+        if changed:
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(merged).strip()+"\n")
+                self.worker_queue.put(("log", "Actualizado .gitignore"))
+            except Exception as e:
+                self.worker_queue.put(("log", f"ERROR escribiendo .gitignore: {e}"))
+
+    def _append_gitignore_patterns(self, project_path, relpaths):
+        """Añade cada ruta dada al .gitignore (si no existe ya)."""
+        if not relpaths: return
+        path = os.path.join(project_path, ".gitignore")
+        current = set()
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    current = set([ln.strip() for ln in f.read().splitlines() if ln.strip()])
+            except:
+                current = set()
+        added = False
+        norm_relpaths = []
+        for rel in relpaths:
+            rel = rel.replace("\\", "/")
+            if rel and rel not in current:
+                norm_relpaths.append(rel)
+        if not norm_relpaths: return
         try:
-            p = subprocess.Popen(["git","credential","approve"],
-                                 text=True, encoding="utf-8", errors="replace",
-                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                 startupinfo=si, creationflags=cf)
-            blob = f"protocol=https\nhost=github.com\nusername={username}\npassword={token}\n\n"
-            p.communicate(input=blob, timeout=10)
-            ok = (p.returncode == 0)
-            if ok: self.worker_queue.put(("log","Token guardado en Credential Manager."))
-            else:  self.worker_queue.put(("log","No se pudo guardar el token en Credential Manager."))
-            return ok
+            with open(path, "a", encoding="utf-8") as f:
+                for rel in norm_relpaths:
+                    f.write(rel + "\n")
+                    added = True
         except Exception as e:
-            self.worker_queue.put(("log", f"ERROR guardando token: {e}"))
+            self.worker_queue.put(("log", f"ERROR escribiendo .gitignore: {e}"))
+            return
+        if added:
+            self.worker_queue.put(("log", "Actualizado .gitignore con archivos grandes."))
+
+    def _is_tracked(self, project_path, relpath):
+        try:
+            out = self._run_check_output(["git","ls-files","--error-unmatch", relpath], cwd=project_path)
+            return bool(out.strip())
+        except subprocess.CalledProcessError: return False
+        except Exception: return False
+
+    def _untrack_list(self, project_path, relpaths):
+        removed = []
+        for rel in relpaths:
+            rc = self._run_cmd(["git","rm","--cached","-f", rel], cwd=project_path)
+            if rc == 0: removed.append(rel)
+        if removed: self.worker_queue.put(("log", "Untrack: " + ", ".join(removed)))
+        return removed
+
+    def _bytes_limit_from_cfg(self):
+        try: return int(self.cfg.get("max_file_size_mb", 95)) * 1024 * 1024
+        except: return 95 * 1024 * 1024
+
+    def _scan_large_files(self, project_path):
+        limit = self._bytes_limit_from_cfg(); big=[]
+        for root, dirs, files in os.walk(project_path):
+            if ".git" in dirs: dirs.remove(".git")
+            for name in files:
+                p = os.path.join(root, name)
+                try:
+                    if os.path.getsize(p) > limit:
+                        rel = os.path.relpath(p, project_path); big.append(rel)
+                except: pass
+        special = "autogit.exe"; sp = os.path.join(project_path, special)
+        if os.path.exists(sp):
+            rel = os.path.relpath(sp, project_path)
+            if rel not in big: big.append(rel)
+        return big
+
+    # --- Limpieza de HISTORIA ---
+    def _run_filter_repo(self, project_path, paths):
+        """Usa 'git filter-repo' (si está instalado) para purgar paths del historial."""
+        try:
+            args = ["git","filter-repo","--force"]
+            for p in paths:
+                args += ["--invert-paths","--path", p]
+            rc = self._run_cmd(args, cwd=project_path)
+            return rc == 0
+        except Exception:
             return False
+
+    def _run_filter_branch(self, project_path, paths):
+        """Fallback: git filter-branch (lento)."""
+        rm_cmd = " && ".join([f"git rm -q -f --cached --ignore-unmatch {p}" for p in paths]) or "echo noop"
+        rc = self._run_cmd(["git","filter-branch","-f","--tree-filter", rm_cmd, "--","--all"], cwd=project_path)
+        if rc != 0: return False
+        self._run_cmd(["git","reflog","expire","--expire=now","--all"], cwd=project_path)
+        self._run_cmd(["git","gc","--prune=now","--aggressive"], cwd=project_path)
+        return True
+
+    def _purge_history_paths(self, project_path, patterns):
+        if not patterns: return True
+        self.worker_queue.put(("log", f"Iniciando limpieza de historia para: {', '.join(patterns)}"))
+        ok = self._run_filter_repo(project_path, patterns)
+        if not ok:
+            self.worker_queue.put(("log","filter-repo no disponible o falló; usando filter-branch (lento)…"))
+            ok = self._run_filter_branch(project_path, patterns)
+        if ok:
+            self.worker_queue.put(("log","Limpieza de historia completada."))
+        else:
+            self.worker_queue.put(("log","ERROR: no se pudo limpiar la historia."))
+        return ok
+
+    # --- Push con reintentos + detección GH001 ---
+    def _git_push_with_retries(self, project_path, origin="origin", branch="main"):
+        attempts = 3
+        for i in range(1, attempts+1):
+            rc, out = self._run_cmd_capture(["git","push","-u",origin,branch], project_path)
+            if rc == 0: return 0
+            text = (out or "").lower()
+            self.worker_queue.put(("log", f"push intento {i}/{attempts} falló (rc={rc})"))
+
+            if any(s in text for s in ["large files detected", "exceeds github's file size limit", "lfs", "gh001"]):
+                large_now = self._scan_large_files(project_path)
+                if large_now:
+                    self._append_gitignore_patterns(project_path, large_now)
+                    self._untrack_list(project_path, large_now)
+                    self._run_cmd(["git","add",".gitignore"], cwd=project_path)
+                    self._run_cmd(["git","commit","--amend","-C","HEAD"], cwd=project_path)
+                purge_patterns = list(set(self.cfg.get("history_purge_patterns", ["autogit.exe"]) + large_now))
+                if not self._purge_history_paths(project_path, purge_patterns):
+                    return rc
+                if self.cfg.get("force_push_after_purge", True):
+                    self._run_cmd(["git","push","--force","--prune","--tags",origin,"+refs/heads/*:refs/heads/*"], cwd=project_path)
+                    return 0
+                else:
+                    continue
+
+            if any(s in text for s in [
+                "http 408", "timeout", "timed out", "the remote end hung up unexpectedly",
+                "unexpected disconnect", "operation timed out", "curl 22", "rpc failed"
+            ]):
+                self._run_cmd(["git","config","http.version","HTTP/1.1"], cwd=project_path)
+                self._run_cmd(["git","config","http.postBuffer","524288000"], cwd=project_path)
+                self._run_cmd(["git","config","http.lowSpeedLimit","0"], cwd=project_path)
+                self._run_cmd(["git","config","http.lowSpeedTime","0"], cwd=project_path)
+                self._run_cmd(["git","repack","-ad","-f","--depth=1","--window=1"], cwd=project_path)
+                self._run_cmd(["git","gc","--prune=now"], cwd=project_path)
+                time.sleep(2*i); continue
+
+            break
+        return rc
+
+    # ---------- Locks ----------
+    def _remove_index_lock_if_any(self, path):
+        top = self._git_toplevel(path)
+        if not top: return False
+        lock = os.path.join(top, ".git", "index.lock")
+        if os.path.exists(lock):
+            try:
+                os.remove(lock); self.worker_queue.put(("log", f"Se removió lock: {lock}"))
+                return True
+            except Exception as e:
+                self.worker_queue.put(("log", f"ERROR eliminando lock {lock}: {e}"))
+        return False
 
     # ---------- Pipeline principal ----------
     def _worker_pipeline(self, project_path, repo_name, commit_msg, create_readme):
@@ -587,7 +714,6 @@ class App(tk.Tk):
             if not self._exe_exists("gh"):
                 self.worker_queue.put(("log","ADVERTENCIA: GitHub CLI (gh) no está en PATH. Se intentará push, pero no se podrá crear el repo remoto automáticamente."))
 
-            # leer preferencias de GUI
             git_name = self.git_user_name_var.get().strip()
             git_mail = self.git_user_email_var.get().strip()
             method   = self.auth_method_var.get().strip() or "gh"
@@ -596,7 +722,6 @@ class App(tk.Tk):
             pat_token= self.pat_token_var.get().strip()
             save_pat = self.pat_save_var.get()
 
-            # identidad git
             steps_identity = [
                 (["git","config","user.name", git_name], "git config user.name"),
                 (["git","config","user.email", git_mail], "git config user.email"),
@@ -605,7 +730,6 @@ class App(tk.Tk):
                 (["git","config","core.longpaths","true"], "git config core.longpaths"),
             ]
 
-            # ¿Repo local?
             first_time = not self._is_git_repo(project_path)
             if first_time:
                 self.worker_queue.put(("stat","Inicializando repo (primera vez)…"))
@@ -624,29 +748,37 @@ class App(tk.Tk):
                             if rc2 == 0: continue
                         self.worker_queue.put(("log", f"ERROR en paso: {label}")); self.worker_queue.put(("done",None)); return
             else:
-                # Asegurar identidad siempre
                 for args, label in steps_identity:
                     if self._run_cmd(args, cwd=project_path)!=0:
                         self.worker_queue.put(("log", f"ERROR en paso: {label}")); self.worker_queue.put(("done",None)); return
                 self._run_cmd(["git","branch","-M","main"], cwd=project_path)
 
-            # Construir remoto según método
+            # .gitignore + untrack básicos
+            self._ensure_gitignore(project_path)
+            self._untrack_list(project_path, ["config.json","log.txt"] + ([os.path.basename(sys.executable)] if getattr(sys,'frozen',False) else []))
+
+            # BLOQUE: archivos grandes en working tree (pre-commit)
+            large = self._scan_large_files(project_path)
+            if large:
+                self._append_gitignore_patterns(project_path, large)
+                self._untrack_list(project_path, large)
+
+            # Remoto
             origin_url = self._build_origin(method, gh_user, repo_name)
             self._ensure_origin(project_path, origin_url)
 
-            # Si PAT: guardar en Credential Manager (opcional) + loguear gh si hace falta para crear remoto
+            # PAT: credenciales + gh login si se puede
             if method == "https_pat" and pat_token:
                 if save_pat: self._save_pat_in_credential_manager(pat_user, pat_token)
                 if self._exe_exists("gh"): self._gh_login_with_token(pat_token)
 
-            # Crear repo remoto si no existe
+            # Crear remoto si no existe
             if self._exe_exists("gh") and gh_user and repo_name and not self._remote_exists(gh_user, repo_name):
                 if not self._create_remote(repo_name):
                     self.worker_queue.put(("log","ERROR: no se pudo crear el repo remoto.")); self.worker_queue.put(("done",None)); return
-                origin_url = self._build_origin(method, gh_user, repo_name)
                 self._ensure_origin(project_path, origin_url)
 
-            # add / commit cambios
+            # add / commit
             rc = self._run_cmd(["git","add","."], cwd=project_path)
             if rc != 0:
                 if self._remove_index_lock_if_any(project_path):
@@ -656,20 +788,15 @@ class App(tk.Tk):
 
             rc = self._run_cmd(["git","diff","--cached","--quiet"], cwd=project_path)
             if rc != 0:
-                if self._run_cmd(["git","commit","-m", commit_msg], cwd=project_path)!=0:
+                if self._run_cmd(["git","commit","-m", self.commit_message_var.get().strip() or "Actualización automática"], cwd=project_path)!=0:
                     self.worker_queue.put(("log","ERROR en commit.")); self.worker_queue.put(("done",None)); return
             else:
                 self.worker_queue.put(("log","No hay cambios para commitear."))
 
-            # push
-            rc = self._run_cmd(["git","push","-u","origin","main"], cwd=project_path)
+            # push (con reintentos + limpieza GH001)
+            rc = self._git_push_with_retries(project_path, "origin", "main")
             if rc != 0:
-                if self._exe_exists("gh") and gh_user and repo_name and not self._remote_exists(gh_user, repo_name):
-                    if self._create_remote(repo_name):
-                        self._ensure_origin(project_path, origin_url)
-                        rc = self._run_cmd(["git","push","-u","origin","main"], cwd=project_path)
-                if rc != 0:
-                    self.worker_queue.put(("log","ERROR en push. Revisa remoto/credenciales.")); self.worker_queue.put(("done",None)); return
+                self.worker_queue.put(("log","ERROR en push. Revisa remoto/credenciales.")); self.worker_queue.put(("done",None)); return
 
             # README opcional
             if self.cfg.get("create_readme_if_missing", True):
@@ -680,7 +807,7 @@ class App(tk.Tk):
                     self.worker_queue.put(("log","README.md creado."))
                     self._run_cmd(["git","add","README.md"], cwd=project_path)
                     if self._run_cmd(["git","commit","-m","Add README"], cwd=project_path)==0:
-                        self._run_cmd(["git","push"], cwd=project_path)
+                        self._git_push_with_retries(project_path, "origin", "main")
 
             self.worker_queue.put(("stat","Pipeline completado."))
 
@@ -688,20 +815,6 @@ class App(tk.Tk):
             self.worker_queue.put(("log", f"ERROR pipeline: {e}")); self.worker_queue.put(("log", traceback.format_exc()))
         finally:
             self.worker_queue.put(("done", None))
-
-    # ---------- Lock / detect helpers ----------
-    def _remove_index_lock_if_any(self, path):
-        top = self._git_toplevel(path)
-        if not top: return False
-        lock = os.path.join(top, ".git", "index.lock")
-        if os.path.exists(lock):
-            try:
-                os.remove(lock)
-                self.worker_queue.put(("log", f"Se removió lock: {lock}"))
-                return True
-            except Exception as e:
-                self.worker_queue.put(("log", f"ERROR eliminando lock {lock}: {e}"))
-        return False
 
     # ---------- Orquestación ----------
     def _start_pipeline(self):
@@ -713,14 +826,10 @@ class App(tk.Tk):
         if not repo:
             self._autodetect_repo_name(); repo=self.repo_name_var.get().strip()
             if not repo: self._status("No se pudo determinar el nombre del repo."); return
-
         self.running=True; self.btn_run.config(state="disabled"); self.btn_stop.config(state="normal")
         self._status("Ejecutando pipeline…")
         self._append_log(f"Iniciando pipeline en: {proj} (repo: {repo})")
-
-        # NO contar durante el pipeline
         self._cancel_autoclose()
-
         t=threading.Thread(target=self._worker_pipeline, args=(proj,repo,self.commit_message_var.get().strip() or "Actualización automática", self.create_readme_var.get()), daemon=True)
         t.start()
 
@@ -741,16 +850,7 @@ class App(tk.Tk):
             pass
         self.after(120, self._poll_worker_queue)
 
-    def _detect_github_user(self):
-        try:
-            si, cf = self._startupinfo_flags()
-            out = subprocess.check_output(["gh","api","user","-q",".login"],
-                                          text=True, encoding="utf-8", errors="replace",
-                                          stderr=subprocess.DEVNULL, startupinfo=si, creationflags=cf)
-            user = out.strip()
-            if user: self.worker_queue.put(("log", f"Usuario GitHub: {user}"))
-            return user
-        except: return ""
+    def _show_about(self): AboutDialog(self, self.cfg.get("version", INITIAL_VERSION))
 
     def on_close(self):
         try:
