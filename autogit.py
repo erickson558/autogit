@@ -732,7 +732,7 @@ class App(tk.Tk):
         return rc
 
     def _run_cmd(self, args, cwd, stream=True, env=None):
-        if not self.running: return 1
+    # Permite correr comandos aunque no esté activo el pipeline (útil si se pulsó "Detener")
         si, cf = self._startupinfo_flags()
         if env is None and args and args[0] == "git" and cwd:
             env = self._git_env(cwd)
