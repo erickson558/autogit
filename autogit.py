@@ -1,11 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-Git Helper GUI – v0.1.9
-- Fix tildes/acentos: forzar UTF-8 en Git (i18n.*), en entorno (LC_ALL/LANG/LESSCHARSET)
+Git Helper GUI – v0.2.1
+- Flujo robusto:
+  * Siempre hace add/commit ANTES de crear/asegurar remoto y hacer push.
+  * Si el remoto no existe: lo crea y luego sube el contenido.
+  * Si ya existe: sube cambios sólo si los hay.
+- Fix tildes/acentos: forzar UTF-8 en Git (i18n.*), entorno (LC_ALL/LANG/LESSCHARSET)
   y saneo automático del último mensaje si salió mojibake.
-- Consolas ocultas para subprocesos.
-- Auto-sync, creación de repo remoto si falta, autodetección de carpeta/ nombre de repo.
-- Manejo GH001, .gitignore/untrack, status bar con countdown, config persistente.
+- Consolas ocultas para subprocesos. Auto-sync, creación de repo remoto si falta,
+  autodetección de carpeta/nombre de repo. Manejo GH001, .gitignore/untrack,
+  status bar con countdown, config persistente.
 """
 
 import os, sys, json, hashlib, threading, datetime, queue, traceback, subprocess, time
@@ -63,14 +67,9 @@ def bump_version(v):
 
 # ---------- Fix mojibake ----------
 def _unmojibake_if_needed(s):
-    """
-    Intenta corregir mojibake típico de decodificar UTF-8 como cp1252/latin1.
-    Si no aplica, devuelve s sin cambios.
-    """
+    """Corrige mojibake típico (UTF-8 leído como latin1)."""
     try:
-        # patrón común: 'automÃ¡tica' -> 'automática'
         fixed = s.encode("latin1").decode("utf-8")
-        # Heurística: si había 'Ã' en original y ahora hay tildes válidas, usamos fixed
         if ("Ã" in s or "�" in s) and any(ch in fixed for ch in u"áéíóúñÁÉÍÓÚÑ"):
             return fixed
     except Exception:
@@ -215,6 +214,7 @@ class App(tk.Tk):
         m_app.add_command(label="Detener", accelerator="Ctrl+D", command=self._stop_pipeline)
         m_app.add_separator()
         m_app.add_command(label="Salir", accelerator="Ctrl+Q", command=self.on_close)
+        m_help = tk.Menu(menubar, tearoff=0)
         m_help = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Ayuda", menu=m_help, underline=0)
         m_help.add_command(label="About", accelerator="F1", command=self._show_about)
@@ -375,9 +375,13 @@ class App(tk.Tk):
 
     def _on_int_change(self, key, raw):
         try:
-            v=int(str(raw).strip()); v=1 if v<1 else (86400 if v>86400 else v)
-        except: v=DEFAULT_CONFIG.get(key,60)
-        self.cfg[key]=v; safe_write_json(CONFIG_PATH,self.cfg); self._bump_on_config_change(f"{key}={v}")
+            v = int(str(raw).strip())
+            v = 1 if v < 1 else (86400 if v > 86400 else v)
+        except:
+            v = DEFAULT_CONFIG.get(key, 60)
+        self.cfg[key] = v
+        safe_write_json(CONFIG_PATH, self.cfg)
+        self._bump_on_config_change(f"{key}={v}")
         self._status(f"Guardado {key} = {v}")
         if key=="autoclose_seconds" and self.autoclose_var.get() and not self.running:
             self._schedule_autoclose()
@@ -472,12 +476,7 @@ class App(tk.Tk):
         return si, cf
 
     def _utf8_env_overlay(self):
-        # Variables que fuerzan UTF-8 en Git/CLI (también útiles en Windows)
-        return {
-            "LC_ALL": "C.UTF-8",
-            "LANG": "C.UTF-8",
-            "LESSCHARSET": "utf-8"
-        }
+        return {"LC_ALL": "C.UTF-8", "LANG": "C.UTF-8", "LESSCHARSET": "utf-8"}
 
     def _git_env(self, project_path):
         env = os.environ.copy()
@@ -486,7 +485,6 @@ class App(tk.Tk):
         env["GIT_DIR"] = os.path.join(project_path, ".git")
         env["GIT_CEILING_DIRECTORIES"] = os.path.dirname(project_path)
 
-        # Evitar consolas por paginadores/editores/prompts
         env["GIT_PAGER"] = "cat"
         env["PAGER"] = "cat"
         env["GH_PAGER"] = "cat"
@@ -494,7 +492,6 @@ class App(tk.Tk):
         env["GCM_INTERACTIVE"] = "Never"
         env["NO_COLOR"] = "1"
 
-        # Forzar UTF-8
         env.update(self._utf8_env_overlay())
         return env
 
@@ -592,6 +589,8 @@ class App(tk.Tk):
         elif current.lower()!=url.lower():
             self.worker_queue.put(("log", f"Actualizando origin: {current} -> {url}"))
             self._run_cmd(["git","remote","set-url","origin", url], cwd=path)
+        else:
+            self.worker_queue.put(("log", f"Origin ya configurado: {current}"))
 
     def _exe_exists(self, name):
         for p in os.environ.get("PATH","").split(os.pathsep):
@@ -636,10 +635,11 @@ class App(tk.Tk):
         except Exception as e:
             self.worker_queue.put(("log", f"ERROR gh auth login: {e}")); return False
 
-    def _create_remote(self, owner_repo):
+    def _create_remote(self, owner_repo, project_path):
+        """Crea el repo remoto y configura 'origin' (no empuja aquí)."""
         if not self._exe_exists("gh"): return False
         self.worker_queue.put(("log", f"Creando repo remoto: {owner_repo} (public)…"))
-        rc = self._run_cmd(["gh","repo","create", owner_repo, "--public"], cwd=None)
+        rc = self._run_cmd(["gh","repo","create", owner_repo, "--public", "--remote", "origin"], cwd=project_path)
         return rc == 0
 
     def _save_pat_in_credential_manager(self, user, token):
@@ -674,7 +674,6 @@ class App(tk.Tk):
                     current = set([ln.strip() for ln in f.read().splitlines() if ln.strip()])
             except:
                 current = set()
-        added = False
         norm_relpaths = []
         for rel in relpaths:
             rel = rel.replace("\\", "/")
@@ -685,12 +684,8 @@ class App(tk.Tk):
             with open(path, "a", encoding="utf-8") as f:
                 for rel in norm_relpaths:
                     f.write(rel + "\n")
-                    added = True
         except Exception as e:
             self.worker_queue.put(("log", f"ERROR escribiendo .gitignore: {e}"))
-            return
-        if added:
-            self.worker_queue.put(("log", "Actualizado .gitignore con archivos grandes."))
 
     def _is_tracked(self, project_path, relpath):
         try:
@@ -703,7 +698,7 @@ class App(tk.Tk):
         removed = []
         for rel in relpaths:
             full = os.path.join(project_path, rel)
-            if not os.path.exists(full):      # evita pathspec not matched
+            if not os.path.exists(full):   # evita pathspec not matched
                 continue
             if not self._is_tracked(project_path, rel):
                 continue
@@ -746,16 +741,12 @@ class App(tk.Tk):
     def _worktree_dirty(self, cwd):
         try:
             si, cf = self._startupinfo_flags()
-            rc1 = subprocess.call(
-                ["git","diff","--cached","--quiet"], cwd=cwd,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                env=self._git_env(cwd), startupinfo=si, creationflags=cf
-            )
-            rc2 = subprocess.call(
-                ["git","diff","--quiet"], cwd=cwd,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                env=self._git_env(cwd), startupinfo=si, creationflags=cf
-            )
+            rc1 = subprocess.call(["git","diff","--cached","--quiet"], cwd=cwd,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                  env=self._git_env(cwd), startupinfo=si, creationflags=cf)
+            rc2 = subprocess.call(["git","diff","--quiet"], cwd=cwd,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                  env=self._git_env(cwd), startupinfo=si, creationflags=cf)
             rc3_out = self._run_check_output(["git","ls-files","--others","--exclude-standard"], cwd=cwd)
             has_untracked = bool((rc3_out or "").strip())
             return (rc1 != 0) or (rc2 != 0) or has_untracked
@@ -820,16 +811,14 @@ class App(tk.Tk):
         if not patterns: return True
         names, routes = [], []
         for p in patterns:
-            if ("/" in p) or ("\\" in p):
-                routes.append(p.replace("\\","/"))
-            else:
-                names.append(p)
+            if ("/" in p) or ("\\" in p): routes.append(p.replace("\\","/"))
+            else: names.append(p)
         to_purge = []
         if names:
             hist_routes = self._find_paths_in_history(project_path, names)
             to_purge.extend(hist_routes)
         to_purge.extend(routes)
-        seen = set(); expanded = []
+        expanded, seen = [], set()
         for r in to_purge:
             if r not in seen:
                 seen.add(r); expanded.append(r)
@@ -876,7 +865,7 @@ class App(tk.Tk):
         self.worker_queue.put(("log", "No se pudo sincronizar automáticamente con el remoto."))
         return False
 
-    # --- Push con reintentos + detección GH001 + non-fast-forward ---
+    # --- Push con reintentos + GH001 + non-fast-forward ---
     def _git_push_with_retries(self, project_path, origin="origin", branch="main"):
         attempts = 3
         for i in range(1, attempts+1):
@@ -885,9 +874,7 @@ class App(tk.Tk):
             text = (out or "").lower()
             self.worker_queue.put(("log", f"push intento {i}/{attempts} falló (rc={rc})"))
 
-            if any(s in text for s in [
-                "fetch first", "non-fast-forward", "updates were rejected", "failed to push some refs"
-            ]):
+            if any(s in text for s in ["fetch first", "non-fast-forward", "updates were rejected", "failed to push some refs"]):
                 if self._sync_with_remote(project_path):
                     rc2, _ = self._run_cmd_capture(["git","push","-u",origin,branch], project_path)
                     if rc2 == 0: return 0
@@ -910,10 +897,8 @@ class App(tk.Tk):
                 else:
                     continue
 
-            if any(s in text for s in [
-                "http 408", "timeout", "timed out", "the remote end hung up unexpectedly",
-                "unexpected disconnect", "operation timed out", "curl 22", "rpc failed"
-            ]):
+            if any(s in text for s in ["http 408", "timeout", "timed out", "the remote end hung up unexpectedly",
+                                       "unexpected disconnect", "operation timed out", "curl 22", "rpc failed"]):
                 self._run_cmd(["git","config","http.version","HTTP/1.1"], cwd=project_path)
                 self._run_cmd(["git","config","http.postBuffer","524288000"], cwd=project_path)
                 self._run_cmd(["git","config","http.lowSpeedLimit","0"], cwd=project_path)
@@ -940,14 +925,13 @@ class App(tk.Tk):
 
     # ---------- Git UTF-8 config & commit message check ----------
     def _ensure_git_utf8_config(self, project_path):
-        """Configura Git para usar UTF-8 en commits y logs (idempotente)."""
         steps = [
             (["git","config","i18n.commitEncoding","utf-8"], "i18n.commitEncoding=utf-8"),
             (["git","config","i18n.logOutputEncoding","utf-8"], "i18n.logOutputEncoding=utf-8"),
             (["git","config","gui.encoding","utf-8"], "gui.encoding=utf-8"),
             (["git","config","core.quotepath","false"], "core.quotepath=false"),
         ]
-        for args, label in steps:
+        for args, _ in steps:
             self._run_cmd(args, cwd=project_path)
 
     def _read_last_commit_message(self, project_path):
@@ -958,10 +942,8 @@ class App(tk.Tk):
             return ""
 
     def _maybe_fix_last_commit_message(self, project_path):
-        """Si el último mensaje parece mojibake, lo corrige con --amend."""
         last = self._read_last_commit_message(project_path)
-        if not last:
-            return
+        if not last: return
         fixed = _unmojibake_if_needed(last)
         if fixed != last:
             self.worker_queue.put(("log", f"Corregido mensaje de commit mojibake:\n  Antes: {last}\n  Ahora:  {fixed}"))
@@ -986,72 +968,43 @@ class App(tk.Tk):
 
             first_time = not self._is_git_repo(project_path)
 
+            # 1) INIT/CONFIG
             if first_time:
                 if self._run_cmd(["git","init"], cwd=project_path) != 0:
                     self.worker_queue.put(("log","ERROR en git init")); self.worker_queue.put(("done",None)); return
-                identity_steps = [
-                    (["git","config","user.name", git_name], "git config user.name"),
-                    (["git","config","user.email", git_mail], "git config user.email"),
-                    (["git","config","core.autocrlf","true"], "git config core.autocrlf"),
-                    (["git","config","core.filemode","false"], "git config core.filemode"),
-                    (["git","config","core.longpaths","true"], "git config core.longpaths"),
-                    (["git","config","core.safecrlf","false"], "git config core.safecrlf"),
-                ]
-                for args, label in identity_steps:
-                    if self._run_cmd(args, cwd=project_path)!=0:
-                        self.worker_queue.put(("log", f"ERROR en paso: {label}")); self.worker_queue.put(("done",None)); return
-                # UTF-8 siempre
-                self._ensure_git_utf8_config(project_path)
-                self._run_cmd(["git","branch","-M","main"], cwd=project_path)
-            else:
-                identity_steps = [
-                    (["git","config","user.name", git_name], "git config user.name"),
-                    (["git","config","user.email", git_mail], "git config user.email"),
-                    (["git","config","core.autocrlf","true"], "git config core.autocrlf"),
-                    (["git","config","core.filemode","false"], "git config core.filemode"),
-                    (["git","config","core.longpaths","true"], "git config core.longpaths"),
-                    (["git","config","core.safecrlf","false"], "git config core.safecrlf"),
-                ]
-                for args, label in identity_steps:
-                    if self._run_cmd(args, cwd=project_path)!=0:
-                        self.worker_queue.put(("log", f"ERROR en paso: {label}")); self.worker_queue.put(("done",None)); return
-                # Asegurar UTF-8 también en repos existentes
-                self._ensure_git_utf8_config(project_path)
-                self._run_cmd(["git","branch","-M","main"], cwd=project_path)
+            identity_steps = [
+                (["git","config","user.name", git_name], "git config user.name"),
+                (["git","config","user.email", git_mail], "git config user.email"),
+                (["git","config","core.autocrlf","true"], "git config core.autocrlf"),
+                (["git","config","core.filemode","false"], "git config core.filemode"),
+                (["git","config","core.longpaths","true"], "git config core.longpaths"),
+                (["git","config","core.safecrlf","false"], "git config core.safecrlf"),
+            ]
+            for args, label in identity_steps:
+                if self._run_cmd(args, cwd=project_path)!=0:
+                    self.worker_queue.put(("log", f"ERROR en paso: {label}")); self.worker_queue.put(("done",None)); return
+            self._ensure_git_utf8_config(project_path)
+            self._run_cmd(["git","branch","-M","main"], cwd=project_path)
 
-            # .gitignore + untrack básicos
+            # 2) .gitignore + untrack + grandes
             self._ensure_gitignore(project_path)
             exe_name = os.path.basename(sys.executable) if getattr(sys,'frozen',False) else None
             to_untrack = ["config.json","log.txt","config_autogit.json","log_autogit.txt"]
             if exe_name: to_untrack.append(exe_name)
             self._untrack_list(project_path, to_untrack)
-
-            # Pre-chequeo de archivos grandes
             large = self._scan_large_files(project_path)
             if large:
                 self._append_gitignore_patterns(project_path, large)
                 self._untrack_list(project_path, large)
 
-            # Remoto: crea si no existe y configura origin
-            origin_url = self._build_origin(method, gh_user, repo_name)
-            if self._exe_exists("gh") and gh_user and repo_name and not self._remote_exists(gh_user, repo_name):
-                owner_repo = f"{gh_user}/{repo_name}"
-                if not self._create_remote(owner_repo):
-                    self.worker_queue.put(("log","ERROR: no se pudo crear el repo remoto.")); self.worker_queue.put(("done",None)); return
-            self._ensure_origin(project_path, origin_url)
-
-            # Autenticación PAT (opcional)
-            if method == "https_pat" and pat_token:
-                if save_pat: self._save_pat_in_credential_manager(pat_user, pat_token)
-                if self._exe_exists("gh"): self._gh_login_with_token(pat_token)
-
-            # add / commit
+            # 3) README inicial si aplica
             if first_time and self.cfg.get("create_readme_if_missing", True):
                 readme_path = os.path.join(project_path, "README.md")
                 if not os.path.exists(readme_path):
                     with open(readme_path,"w",encoding="utf-8") as f:
                         f.write(f"# {repo_name}\n\nProyecto {repo_name}.\n")
 
+            # 4) ALWAYS add & commit ANTES de tocar el remoto
             rc = self._run_cmd(["git","add","."], cwd=project_path)
             if rc != 0:
                 if self._remove_index_lock_if_any(project_path):
@@ -1078,7 +1031,6 @@ class App(tk.Tk):
             else:
                 if rc_diff_cached != 0:
                     commit_msg_use = (self.commit_message_var.get().strip() or "Actualización automática")
-                    # Asegurar que el texto que mandamos esté en buena forma
                     commit_msg_use = _unmojibake_if_needed(commit_msg_use)
                     rc_commit = self._run_cmd(["git","commit","-m", commit_msg_use], cwd=project_path)
                     if rc_commit != 0:
@@ -1086,10 +1038,23 @@ class App(tk.Tk):
                 else:
                     self.worker_queue.put(("log","No hay cambios para commitear."))
 
-            # Verificar/Corregir mojibake del último commit si hicimos commit
+            # Corregir mojibake del último commit si aplica
             self._maybe_fix_last_commit_message(project_path)
 
-            # push (con reintentos + limpieza GH001 + auto-sync)
+            # 5) REMOTO: crear si no existe y configurar origin (después del commit)
+            origin_url = self._build_origin(method, gh_user, repo_name)
+            if self._exe_exists("gh") and gh_user and repo_name and not self._remote_exists(gh_user, repo_name):
+                owner_repo = f"{gh_user}/{repo_name}"
+                if not self._create_remote(owner_repo, project_path):
+                    self.worker_queue.put(("log","ERROR: no se pudo crear el repo remoto.")); self.worker_queue.put(("done",None)); return
+            self._ensure_origin(project_path, origin_url)
+
+            # Autenticación PAT (opcional)
+            if method == "https_pat" and pat_token:
+                if save_pat: self._save_pat_in_credential_manager(pat_user, pat_token)
+                if self._exe_exists("gh"): self._gh_login_with_token(pat_token)
+
+            # 6) PUSH con reintentos (sube contenido sí o sí)
             rc = self._git_push_with_retries(project_path, "origin", "main")
             if rc != 0:
                 self.worker_queue.put(("log","ERROR en push. Revisa remoto/credenciales.")); self.worker_queue.put(("done",None)); return
