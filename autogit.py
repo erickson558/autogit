@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Git Helper GUI – v0.2.1
+Git Helper GUI – v0.2.2
+- FIX: Autenticación HTTPS y credenciales para primer push
+- FIX: Configuración automática de credential helper
+- FIX: Manejo robusto de errores de autenticación
 - Flujo robusto:
   * Siempre hace add/commit ANTES de crear/asegurar remoto y hacer push.
   * Si el remoto no existe: lo crea y luego sube el contenido.
@@ -579,7 +582,16 @@ class App(tk.Tk):
         except: return ""
 
     def _build_origin(self, method, github_user, repo):
-        return f"git@github.com:{github_user}/{repo}.git" if method=="ssh" else f"https://github.com/{github_user}/{repo}.git"
+        if method == "ssh":
+            return f"git@github.com:{github_user}/{repo}.git"
+        elif method == "https_pat":
+            pat_token = self.pat_token_var.get().strip()
+            if pat_token:
+                return f"https://{github_user}:{pat_token}@github.com/{github_user}/{repo}.git"
+            else:
+                return f"https://github.com/{github_user}/{repo}.git"
+        else:  # gh
+            return f"https://github.com/{github_user}/{repo}.git"
 
     def _ensure_origin(self, path, url):
         current = self._remote_url(path)
@@ -643,7 +655,6 @@ class App(tk.Tk):
         if rc == 0:
             self._ensure_origin(project_path, self._build_origin("gh", owner_repo.split("/")[0], owner_repo.split("/")[1]))
         return rc == 0
-
 
     def _save_pat_in_credential_manager(self, user, token):
         self.worker_queue.put(("log", "PAT no se persiste automáticamente (stub)."))
@@ -868,38 +879,65 @@ class App(tk.Tk):
         self.worker_queue.put(("log", "No se pudo sincronizar automáticamente con el remoto."))
         return False
 
+    # --- Configuración de credenciales para HTTPS ---
+    def _setup_credentials(self, project_path, method):
+        """Configura las credenciales según el método de autenticación"""
+        if method == "https_pat":
+            # Configurar credential helper para evitar prompts
+            self._run_cmd(["git", "config", "credential.helper", "store"], cwd=project_path)
+            self._run_cmd(["git", "config", "credential.useHttpPath", "true"], cwd=project_path)
+            
+            # Si hay PAT token, configurar la URL con credenciales embebidas
+            pat_token = self.pat_token_var.get().strip()
+            if pat_token:
+                github_user = self.github_user_var.get().strip()
+                repo_name = self.repo_name_var.get().strip()
+                origin_url = f"https://{github_user}:{pat_token}@github.com/{github_user}/{repo_name}.git"
+                self._ensure_origin(project_path, origin_url)
+        
+        elif method == "gh":
+            # Verificar autenticación de GitHub CLI
+            if not self._gh_auth_status_ok():
+                self.worker_queue.put(("log", "⚠️ GitHub CLI no autenticado. Intentando autenticar…"))
+                # Intentar autenticar con token si está disponible
+                pat_token = self.pat_token_var.get().strip()
+                if pat_token:
+                    self._gh_login_with_token(pat_token)
+                else:
+                    self.worker_queue.put(("log", "❌ No hay token PAT disponible para autenticar GitHub CLI"))
+        
+        # Configuración común para evitar prompts
+        self._run_cmd(["git", "config", "core.askPass", "echo"], cwd=project_path)
+
     # --- Push con reintentos + GH001 + non-fast-forward ---
     def _git_push_with_retries(self, project_path, origin="origin", branch="main"):
         attempts = 3
         method = self.auth_method_var.get().strip() or "gh"
-    
-        # Verifica si estás autenticado con GitHub CLI
-        if method == "gh" and not self._gh_auth_status_ok():
-            self.worker_queue.put(("log", "⚠️ GitHub CLI no está autenticado. Ejecuta en consola: gh auth login"))
-    
-        # Verifica si estás usando HTTPS sin token
-        origin_url = self._remote_url(project_path)
-        if method.startswith("https") and "@" not in origin_url:
-            self.worker_queue.put(("log", "⚠️ Estás usando HTTPS pero no se detectó token embebido en la URL ni autenticación interactiva."))
-            self.worker_queue.put(("log", "👉 Solución: Ejecuta 'gh auth login' o cambia a autenticación por SSH."))
+        
+        # Configurar credenciales antes del primer intento
+        self._setup_credentials(project_path, method)
 
         for i in range(1, attempts + 1):
             rc, out = self._run_cmd_capture(["git", "push", "-u", origin, branch], project_path)
             if rc == 0:
+                self.worker_queue.put(("log", "✅ Push exitoso"))
                 return 0
     
             text = (out or "").lower()
             self.worker_queue.put(("log", f"push intento {i}/{attempts} falló (rc={rc})"))
     
             if any(s in text for s in ["fetch first", "non-fast-forward", "updates were rejected", "failed to push some refs"]):
+                self.worker_queue.put(("log", "🔄 Intentando sincronizar con remoto…"))
                 if self._sync_with_remote(project_path):
                     rc2, _ = self._run_cmd_capture(["git", "push", "-u", origin, branch], project_path)
                     if rc2 == 0:
+                        self.worker_queue.put(("log", "✅ Push exitoso después de sincronizar"))
                         return 0
                     else:
-                        self.worker_queue.put(("log", "Push aún rechazado tras sincronizar."))
+                        self.worker_queue.put(("log", "❌ Push aún rechazado tras sincronizar"))
         
             if any(s in text for s in ["large files detected", "exceeds github's file size limit", "lfs", "gh001"]):
+                self.worker_queue.put(("log", "📦 Detectados archivos grandes, limpiando…"))
                 large_now = self._scan_large_files(project_path)
                 if large_now:
                     self._append_gitignore_patterns(project_path, large_now)
@@ -912,12 +950,14 @@ class App(tk.Tk):
                 if self.cfg.get("force_push_after_purge", True):
                     self._run_cmd(["git", "push", "--force", "--prune", origin, "+refs/heads/*:refs/heads/*"], cwd=project_path)
                     self._run_cmd(["git", "push", "--force", "--prune", origin, "+refs/tags/*:refs/tags/*"], cwd=project_path)
+                    self.worker_queue.put(("log", "✅ Push forzado exitoso después de limpieza"))
                     return 0
                 else:
                     continue
         
             if any(s in text for s in ["http 408", "timeout", "timed out", "the remote end hung up unexpectedly",
                                         "unexpected disconnect", "operation timed out", "curl 22", "rpc failed"]):
+                self.worker_queue.put(("log", "⏰ Timeout detectado, reconfigurando HTTP…"))
                 self._run_cmd(["git", "config", "http.version", "HTTP/1.1"], cwd=project_path)
                 self._run_cmd(["git", "config", "http.postBuffer", "524288000"], cwd=project_path)
                 self._run_cmd(["git", "config", "http.lowSpeedLimit", "0"], cwd=project_path)
@@ -926,11 +966,31 @@ class App(tk.Tk):
                 self._run_cmd(["git", "gc", "--prune=now"], cwd=project_path)
                 time.sleep(2 * i)
                 continue
+            
+            # Manejo específico de errores de autenticación
+            if any(s in text for s in ["authentication failed", "could not read username", "terminal prompts disabled"]):
+                self.worker_queue.put(("log", "🔐 Error de autenticación detectado"))
+                if method == "https_pat":
+                    pat_token = self.pat_token_var.get().strip()
+                    if pat_token:
+                        github_user = self.github_user_var.get().strip()
+                        repo_name = self.repo_name_var.get().strip()
+                        # Reconfigurar origin con credenciales embebidas
+                        origin_url = f"https://{github_user}:{pat_token}@github.com/{github_user}/{repo_name}.git"
+                        self._ensure_origin(project_path, origin_url)
+                        self.worker_queue.put(("log", "🔄 Reconfigurado origin con credenciales embebidas"))
+                    else:
+                        self.worker_queue.put(("log", "❌ No hay PAT token configurado para autenticación HTTPS"))
+                elif method == "gh":
+                    self.worker_queue.put(("log", "❌ GitHub CLI no está autenticado. Ejecuta 'gh auth login' manualmente"))
+                
+                # Intentar con store credential como fallback
+                self._run_cmd(["git", "config", "credential.helper", "store"], cwd=project_path)
     
             break
 
+        self.worker_queue.put(("log", f"❌ Todos los intentos de push fallaron"))
         return rc
-
 
     # ---------- Locks ----------
     def _remove_index_lock_if_any(self, path):
@@ -977,23 +1037,25 @@ class App(tk.Tk):
             self.worker_queue.put(("stat","Verificando herramientas…"))
             if not self._exe_exists("git"):
                 self.worker_queue.put(("log","ERROR: Git no está en PATH.")); self.worker_queue.put(("done",None)); return
-            if not self._exe_exists("gh"):
-                self.worker_queue.put(("log","ADVERTENCIA: GitHub CLI (gh) no está en PATH. Se intentará push, pero no se podrá crear el repo remoto automáticamente."))
-
+            
             git_name = self.git_user_name_var.get().strip()
             git_mail = self.git_user_email_var.get().strip()
             method   = self.auth_method_var.get().strip() or "gh"
             gh_user  = self.github_user_var.get().strip()
-            pat_user = self.pat_user_var.get().strip() or "github"
-            pat_token= self.pat_token_var.get().strip()
-            save_pat = self.pat_save_var.get()
+
+            # Verificar GitHub CLI si se usa ese método
+            if method == "gh" and not self._exe_exists("gh"):
+                self.worker_queue.put(("log","ADVERTENCIA: GitHub CLI (gh) no está en PATH. Se intentará push directo."))
 
             first_time = not self._is_git_repo(project_path)
 
             # 1) INIT/CONFIG
             if first_time:
+                self.worker_queue.put(("log","🆕 Inicializando repositorio Git…"))
                 if self._run_cmd(["git","init"], cwd=project_path) != 0:
                     self.worker_queue.put(("log","ERROR en git init")); self.worker_queue.put(("done",None)); return
+            
+            # Configurar identidad y opciones básicas
             identity_steps = [
                 (["git","config","user.name", git_name], "git config user.name"),
                 (["git","config","user.email", git_mail], "git config user.email"),
@@ -1005,6 +1067,7 @@ class App(tk.Tk):
             for args, label in identity_steps:
                 if self._run_cmd(args, cwd=project_path)!=0:
                     self.worker_queue.put(("log", f"ERROR en paso: {label}")); self.worker_queue.put(("done",None)); return
+            
             self._ensure_git_utf8_config(project_path)
             self._run_cmd(["git","branch","-M","main"], cwd=project_path)
 
@@ -1027,6 +1090,7 @@ class App(tk.Tk):
                         f.write(f"# {repo_name}\n\nProyecto {repo_name}.\n")
 
             # 4) ALWAYS add & commit ANTES de tocar el remoto
+            self.worker_queue.put(("log","📦 Agregando archivos al staging…"))
             rc = self._run_cmd(["git","add","."], cwd=project_path)
             if rc != 0:
                 if self._remove_index_lock_if_any(project_path):
@@ -1034,6 +1098,7 @@ class App(tk.Tk):
                 if rc != 0:
                     self.worker_queue.put(("log","ERROR en git add .")); self.worker_queue.put(("done",None)); return
 
+            # Verificar si hay cambios para commit
             si, cf = self._startupinfo_flags()
             rc_diff_cached = subprocess.call(
                 ["git","diff","--cached","--quiet"],
@@ -1045,46 +1110,58 @@ class App(tk.Tk):
                 creationflags=cf
             )
 
-            if first_time:
-                commit_msg_use = (self.commit_message_var.get().strip() or "Primer commit")
-                args = ["git","commit","-m", commit_msg_use] if rc_diff_cached != 0 else ["git","commit","-m", commit_msg_use, "--allow-empty"]
-                if self._run_cmd(args, cwd=project_path) != 0:
-                    self.worker_queue.put(("log","ERROR en commit inicial.")); self.worker_queue.put(("done",None)); return
-            else:
-                if rc_diff_cached != 0:
-                    commit_msg_use = (self.commit_message_var.get().strip() or "Actualización automática")
-                    commit_msg_use = _unmojibake_if_needed(commit_msg_use)
-                    rc_commit = self._run_cmd(["git","commit","-m", commit_msg_use], cwd=project_path)
-                    if rc_commit != 0:
-                        self.worker_queue.put(("log","No hay cambios para commitear (post-inicial)."))
+            if first_time or rc_diff_cached != 0:
+                commit_msg_use = (self.commit_message_var.get().strip() or 
+                                 "Primer commit" if first_time else "Actualización automática")
+                
+                if first_time and rc_diff_cached == 0:
+                    # Primer commit puede estar vacío
+                    args = ["git","commit","-m", commit_msg_use, "--allow-empty"]
                 else:
-                    self.worker_queue.put(("log","No hay cambios para commitear."))
+                    args = ["git","commit","-m", commit_msg_use]
+                
+                self.worker_queue.put(("log",f"💾 Creando commit: {commit_msg_use}"))
+                if self._run_cmd(args, cwd=project_path) != 0:
+                    self.worker_queue.put(("log","ERROR en commit.")); self.worker_queue.put(("done",None)); return
+            else:
+                self.worker_queue.put(("log","✅ No hay cambios para commitear."))
 
             # Corregir mojibake del último commit si aplica
             self._maybe_fix_last_commit_message(project_path)
 
             # 5) REMOTO: crear si no existe y configurar origin (después del commit)
             origin_url = self._build_origin(method, gh_user, repo_name)
-            if self._exe_exists("gh") and gh_user and repo_name and not self._remote_exists(gh_user, repo_name):
+            
+            # Verificar si el repo remoto existe y crear si es necesario
+            remote_exists = False
+            if self._exe_exists("gh") and gh_user and repo_name:
+                remote_exists = self._remote_exists(gh_user, repo_name)
+            
+            if not remote_exists:
+                self.worker_queue.put(("log","🌐 Repositorio remoto no existe, creando…"))
                 owner_repo = f"{gh_user}/{repo_name}"
-                if not self._create_remote(owner_repo, project_path):
-                    self.worker_queue.put(("log","ERROR: no se pudo crear el repo remoto.")); self.worker_queue.put(("done",None)); return
+                if self._exe_exists("gh"):
+                    if not self._create_remote(owner_repo, project_path):
+                        self.worker_queue.put(("log","❌ No se pudo crear el repo remoto automáticamente"))
+                        # Continuar de todas formas, el usuario puede crearlo manualmente
+                else:
+                    self.worker_queue.put(("log","ℹ️ GitHub CLI no disponible, asumiendo repo remoto existe"))
+            else:
+                self.worker_queue.put(("log","✅ Repositorio remoto existe"))
+            
+            # Configurar origin
             self._ensure_origin(project_path, origin_url)
 
-            # Autenticación PAT (opcional)
-            if method == "https_pat" and pat_token:
-                if save_pat: self._save_pat_in_credential_manager(pat_user, pat_token)
-                if self._exe_exists("gh"): self._gh_login_with_token(pat_token)
-
             # 6) PUSH con reintentos (sube contenido sí o sí)
+            self.worker_queue.put(("log","🚀 Subiendo cambios al repositorio remoto…"))
             rc = self._git_push_with_retries(project_path, "origin", "main")
             if rc != 0:
-                self.worker_queue.put(("log","ERROR en push. Revisa remoto/credenciales.")); self.worker_queue.put(("done",None)); return
+                self.worker_queue.put(("log","❌ ERROR en push. Revisa remoto/credenciales.")); self.worker_queue.put(("done",None)); return
 
-            self.worker_queue.put(("stat","Pipeline completado."))
+            self.worker_queue.put(("stat","✅ Pipeline completado exitosamente"))
 
         except Exception as e:
-            self.worker_queue.put(("log", f"ERROR pipeline: {e}"))
+            self.worker_queue.put(("log", f"❌ ERROR pipeline: {e}"))
             self.worker_queue.put(("log", traceback.format_exc()))
         finally:
             self.worker_queue.put(("done", None))
