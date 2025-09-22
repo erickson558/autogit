@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-Git Helper GUI – v0.2.3
-- FIX: Autenticación con PAT token obligatorio para HTTPS
-- FIX: Eliminada autenticación por password obsoleta
-- FIX: Mejor manejo de errores de GitHub
-- Flujo robusto con PAT token requerido
+Git Helper GUI – v0.2.4
+- ADD: Función para testear PAT token antes de usarlo
+- ADD: Botón "Test PAT" para verificar credenciales
+- ADD: Validación de permisos del token
+- FIX: Mejor manejo de errores de autenticación
 """
 
 import os, sys, json, hashlib, threading, datetime, queue, traceback, subprocess, time
+import base64
 
 try:
     import tkinter as tk
@@ -145,6 +146,47 @@ class AboutDialog(tk.Toplevel):
         ttk.Button(frm, text="Cerrar (Esc)", command=self.destroy).pack()
         self.bind("<Escape>", lambda e: self.destroy())
 
+class TestPATDialog(tk.Toplevel):
+    def __init__(self, master, test_function):
+        super().__init__(master)
+        self.title("Test PAT Token")
+        self.geometry("500x300")
+        self.configure(bg="#101418")
+        self.test_function = test_function
+        self.result = None
+        
+        frm = tk.Frame(self, bg="#101418")
+        frm.pack(fill="both", expand=True, padx=16, pady=16)
+        
+        tk.Label(frm, text="🔐 Test de PAT Token", fg="#E6EDF3", bg="#101418", 
+                font=("Segoe UI", 12, "bold")).pack(pady=(0, 10))
+        
+        self.text_widget = tk.Text(frm, height=12, width=60, bg="#0F1620", fg="#C9D1D9", 
+                                  font=("Consolas", 9), wrap="word")
+        self.text_widget.pack(fill="both", expand=True, pady=(0, 10))
+        
+        btn_frame = tk.Frame(frm, bg="#101418")
+        btn_frame.pack(fill="x")
+        
+        ttk.Button(btn_frame, text="Ejecutar Test", command=self._run_test).pack(side="left", padx=(0, 10))
+        ttk.Button(btn_frame, text="Cerrar", command=self.destroy).pack(side="left")
+        
+        self._append_text("Presiona 'Ejecutar Test' para verificar el PAT token...\n")
+        
+    def _append_text(self, text):
+        self.text_widget.insert("end", text)
+        self.text_widget.see("end")
+        self.update()
+        
+    def _run_test(self):
+        self._append_text("\n" + "="*50 + "\n")
+        self._append_text("🔍 Iniciando test de PAT token...\n")
+        self.result = self.test_function(self._append_text)
+        if self.result:
+            self._append_text("\n✅ TEST EXITOSO - El PAT token es válido\n")
+        else:
+            self._append_text("\n❌ TEST FALLIDO - Revisa el token\n")
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -206,6 +248,7 @@ class App(tk.Tk):
         m_app = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Aplicación", menu=m_app, underline=0)
         m_app.add_command(label="Ejecutar pipeline", accelerator="Ctrl+R", command=self._start_pipeline)
+        m_app.add_command(label="Test PAT Token", accelerator="Ctrl+T", command=self._test_pat_token)
         m_app.add_command(label="Detener", accelerator="Ctrl+D", command=self._stop_pipeline)
         m_app.add_separator()
         m_app.add_command(label="Salir", accelerator="Ctrl+Q", command=self.on_close)
@@ -291,7 +334,7 @@ class App(tk.Tk):
         pat_frame = ttk.Frame(rowE); pat_frame.grid(row=1, column=0, columnspan=5, sticky="we", padx=6, pady=6)
         ttk.Label(pat_frame, text="🔑 PAT Token (OBLIGATORIO):", foreground="#FF6B6B").pack(side="left")
         self.pat_token_var = tk.StringVar(value=self.cfg.get("pat_token",""))
-        self.e_pt = ttk.Entry(pat_frame, width=50, textvariable=self.pat_token_var, show="•")
+        self.e_pt = ttk.Entry(pat_frame, width=40, textvariable=self.pat_token_var, show="•")
         self.e_pt.pack(side="left", padx=6, fill="x", expand=True)
         self.e_pt.bind("<KeyRelease>", lambda e: self._on_str_change("pat_token", self.pat_token_var.get()))
         
@@ -299,8 +342,9 @@ class App(tk.Tk):
         def toggle_pat():
             self._pat_shown = not self._pat_shown
             self.e_pt.config(show="" if self._pat_shown else "•")
-        ttk.Button(pat_frame, text="Mostrar", width=10, command=toggle_pat).pack(side="left", padx=6)
-        ttk.Button(pat_frame, text="Instrucciones", width=12, command=self._show_pat_instructions).pack(side="left", padx=6)
+        ttk.Button(pat_frame, text="Mostrar", width=8, command=toggle_pat).pack(side="left", padx=6)
+        ttk.Button(pat_frame, text="Test PAT", width=8, command=self._test_pat_token).pack(side="left", padx=6)
+        ttk.Button(pat_frame, text="Instrucciones", width=10, command=self._show_pat_instructions).pack(side="left", padx=6)
 
         ttk.Label(rowE, text="PAT usuario:").grid(row=2, column=0, sticky="w", padx=6, pady=6)
         self.pat_user_var = tk.StringVar(value=self.cfg.get("pat_username","erickson558"))
@@ -339,9 +383,11 @@ class App(tk.Tk):
 
         rowG = ttk.Frame(body); rowG.pack(fill="x", pady=(12,6))
         self.btn_run  = ttk.Button(rowG, text="Ejecutar pipeline (Ctrl+R)", command=self._start_pipeline)
+        self.btn_test = ttk.Button(rowG, text="Test PAT Token (Ctrl+T)", command=self._test_pat_token)
         self.btn_stop = ttk.Button(rowG, text="Detener (Ctrl+D)", command=self._stop_pipeline, state="disabled")
         self.btn_exit = ttk.Button(rowG, text="Salir (Ctrl+Q)", command=self.on_close)
-        self.btn_run.pack(side="left"); self.btn_stop.pack(side="left", padx=8); self.btn_exit.pack(side="right")
+        self.btn_run.pack(side="left"); self.btn_test.pack(side="left", padx=8)
+        self.btn_stop.pack(side="left", padx=8); self.btn_exit.pack(side="right")
 
         logf = ttk.Frame(body); logf.pack(fill="both", expand=True, pady=(8,8))
         self.txt_log = tk.Text(logf, height=14, bg="#0F1620", fg="#C9D1D9", insertbackground="#C9D1D9", relief="flat", wrap="word")
@@ -386,9 +432,150 @@ class App(tk.Tk):
         
         messagebox.showinfo("Instrucciones PAT Token", instructions)
 
+    # ---------- Test PAT Token Function ----------
+    def _test_pat_token(self, callback=None):
+        """Testea el PAT token contra la API de GitHub"""
+        pat_token = self.pat_token_var.get().strip()
+        github_user = self.github_user_var.get().strip()
+        
+        if not pat_token:
+            msg = "❌ ERROR: No hay PAT token configurado"
+            if callback: callback(msg + "\n")
+            else: messagebox.showerror("Error", msg)
+            return False
+        
+        if not github_user:
+            msg = "❌ ERROR: No hay usuario GitHub configurado"
+            if callback: callback(msg + "\n")
+            else: messagebox.showerror("Error", msg)
+            return False
+        
+        if callback is None:
+            # Abrir diálogo de test
+            TestPATDialog(self, self._test_pat_token)
+            return True
+        
+        # Función de test real
+        import urllib.request
+        import urllib.error
+        import json as json_lib
+        
+        callback("🔍 Testeando PAT token...\n")
+        callback(f"Usuario: {github_user}\n")
+        callback(f"Token: {pat_token[:8]}...\n\n")
+        
+        # Test 1: Verificar token básico
+        callback("1. Verificando autenticación básica...\n")
+        try:
+            # Crear request a la API de GitHub
+            url = "https://api.github.com/user"
+            headers = {
+                'Authorization': f'token {pat_token}',
+                'User-Agent': 'AutoGit-App',
+                'Accept': 'application/vnd.github.v3+json'
+            }
+            
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=10) as response:
+                data = json_lib.loads(response.read().decode())
+                callback(f"   ✅ Autenticación exitosa\n")
+                callback(f"   👤 Usuario: {data.get('login', 'N/A')}\n")
+                callback(f"   📧 Email: {data.get('email', 'N/A')}\n")
+                callback(f"   📊 Límite de API: {response.headers.get('X-RateLimit-Limit', 'N/A')}\n")
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                callback("   ❌ Token inválido o expirado\n")
+                return False
+            elif e.code == 403:
+                callback("   ❌ Token sin permisos suficientes\n")
+                return False
+            else:
+                callback(f"   ❌ Error HTTP {e.code}: {e.reason}\n")
+                return False
+        except Exception as e:
+            callback(f"   ❌ Error de conexión: {str(e)}\n")
+            return False
+        
+        # Test 2: Verificar permisos de repositorio
+        callback("\n2. Verificando permisos de repositorio...\n")
+        try:
+            url = "https://api.github.com/user/repos?per_page=1"
+            headers = {
+                'Authorization': f'token {pat_token}',
+                'User-Agent': 'AutoGit-App',
+                'Accept': 'application/vnd.github.v3+json'
+            }
+            
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=10) as response:
+                callback("   ✅ Permisos de repositorio OK\n")
+        except urllib.error.HTTPError as e:
+            if e.code == 403:
+                callback("   ❌ Token no tiene permisos de repositorio\n")
+                return False
+            else:
+                callback(f"   ⚠️ Error HTTP {e.code} (puede ser normal)\n")
+        
+        # Test 3: Verificar acceso a repositorio específico
+        repo_name = self.repo_name_var.get().strip()
+        if repo_name:
+            callback(f"\n3. Verificando acceso a repositorio '{repo_name}'...\n")
+            try:
+                url = f"https://api.github.com/repos/{github_user}/{repo_name}"
+                headers = {
+                    'Authorization': f'token {pat_token}',
+                    'User-Agent': 'AutoGit-App',
+                    'Accept': 'application/vnd.github.v3+json'
+                }
+                
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=10) as response:
+                    data = json_lib.loads(response.read().decode())
+                    callback(f"   ✅ Repositorio accesible: {data.get('html_url', 'N/A')}\n")
+            except urllib.error.HTTPError as e:
+                if e.code == 404:
+                    callback("   ℹ️ Repositorio no existe (se creará automáticamente)\n")
+                else:
+                    callback(f"   ⚠️ Error HTTP {e.code} al acceder al repo\n")
+        
+        # Test 4: Verificar con Git (test real)
+        callback("\n4. Testeando con Git...\n")
+        test_dir = os.path.join(os.path.expanduser("~"), ".autogit_test")
+        try:
+            os.makedirs(test_dir, exist_ok=True)
+            
+            # Configurar Git para el test
+            self._run_cmd(["git", "config", "user.name", "Test User"], test_dir)
+            self._run_cmd(["git", "config", "user.email", "test@example.com"], test_dir)
+            
+            # Crear un repo de test
+            if not os.path.exists(os.path.join(test_dir, ".git")):
+                self._run_cmd(["git", "init"], test_dir)
+            
+            # Configurar remote con PAT
+            test_repo_url = f"https://{github_user}:{pat_token}@github.com/{github_user}/autogit-test-repo.git"
+            self._run_cmd(["git", "remote", "remove", "origin"], test_dir)
+            self._run_cmd(["git", "remote", "add", "origin", test_repo_url], test_dir)
+            
+            # Intentar fetch (sin realmente hacerlo, solo verificar credenciales)
+            rc, out = self._run_cmd_capture(["git", "ls-remote", "origin"], test_dir)
+            if rc == 0:
+                callback("   ✅ Git authentication OK\n")
+            else:
+                callback("   ❌ Git authentication failed\n")
+                return False
+                
+        except Exception as e:
+            callback(f"   ⚠️ Error en test Git: {str(e)}\n")
+        
+        callback("\n🎉 TODOS LOS TESTS COMPLETADOS\n")
+        callback("El PAT token parece estar configurado correctamente.\n")
+        return True
+
     # ---------- Shortcuts / About ----------
     def _bind_shortcuts(self):
         self.bind_all("<Control-r>", lambda e: self._start_pipeline())
+        self.bind_all("<Control-t>", lambda e: self._test_pat_token())
         self.bind_all("<Control-d>", lambda e: self._stop_pipeline())
         self.bind_all("<Control-q>", lambda e: self.on_close())
         self.bind_all("<F1>",        lambda e: self._show_about())
@@ -938,6 +1125,11 @@ class App(tk.Tk):
                 self.worker_queue.put(("log", "💡 Ve a GitHub Settings > Tokens y crea un PAT token"))
                 return False
             
+            # Test rápido del token antes de usarlo
+            if not self._test_pat_token_quick():
+                self.worker_queue.put(("log", "❌ El PAT token no es válido"))
+                return False
+            
             github_user = self.github_user_var.get().strip()
             repo_name = self.repo_name_var.get().strip()
             
@@ -969,6 +1161,30 @@ class App(tk.Tk):
         
         return True
 
+    def _test_pat_token_quick(self):
+        """Test rápido del PAT token sin interfaz gráfica"""
+        pat_token = self.pat_token_var.get().strip()
+        if not pat_token:
+            return False
+            
+        import urllib.request
+        import urllib.error
+        import json as json_lib
+        
+        try:
+            url = "https://api.github.com/user"
+            headers = {
+                'Authorization': f'token {pat_token}',
+                'User-Agent': 'AutoGit-App',
+                'Accept': 'application/vnd.github.v3+json'
+            }
+            
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=5) as response:
+                return response.code == 200
+        except:
+            return False
+
     # --- Push con reintentos + GH001 + non-fast-forward ---
     def _git_push_with_retries(self, project_path, origin="origin", branch="main"):
         attempts = 3
@@ -979,7 +1195,7 @@ class App(tk.Tk):
             pat_token = self.pat_token_var.get().strip()
             if not pat_token:
                 self.worker_queue.put(("log", "❌ ERROR: No hay PAT token configurado"))
-                self.worker_queue.put(("log", "💡 Usa F2 para ver instrucciones de cómo crear un PAT token"))
+                self.worker_queue.put(("log", "💡 Usa Ctrl+T para testear el token"))
                 return 1
 
         # Configurar credenciales antes del primer intento
@@ -1042,7 +1258,7 @@ class App(tk.Tk):
                 
                 if method == "https_pat":
                     self.worker_queue.put(("log", "❌ El PAT token puede ser inválido o no tener permisos suficientes"))
-                    self.worker_queue.put(("log", "💡 Verifica que el token tenga permisos 'repo' y no haya expirado"))
+                    self.worker_queue.put(("log", "💡 Usa Ctrl+T para verificar el token"))
                 
                 # Reconfigurar credenciales
                 self._setup_credentials(project_path, method)
@@ -1108,7 +1324,7 @@ class App(tk.Tk):
                 pat_token = self.pat_token_var.get().strip()
                 if not pat_token:
                     self.worker_queue.put(("log","❌ ERROR: No hay PAT token configurado"))
-                    self.worker_queue.put(("log","💡 Usa F2 para ver instrucciones de cómo crear un PAT token"))
+                    self.worker_queue.put(("log","💡 Usa Ctrl+T para testear el token"))
                     self.worker_queue.put(("done",None)); return
 
             first_time = not self._is_git_repo(project_path)
@@ -1244,10 +1460,10 @@ class App(tk.Tk):
         # Verificar PAT token antes de iniciar
         method = self.auth_method_var.get().strip() or "https_pat"
         if method == "https_pat" and not self.pat_token_var.get().strip():
-            self._status("ERROR: Configura un PAT token primero (F2 para instrucciones)")
+            self._status("ERROR: Configura un PAT token primero (Ctrl+T para testear)")
             messagebox.showerror("PAT Token Requerido", 
                                "Debes configurar un Personal Access Token (PAT) de GitHub.\n\n" 
-                               "Presiona F2 para ver instrucciones de cómo crear uno.")
+                               "Presiona Ctrl+T para testear el token o F2 para instrucciones.")
             return
         
         self.running=True; self.btn_run.config(state="disabled"); self.btn_stop.config(state="normal")
