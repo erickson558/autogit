@@ -1,14 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Git Helper GUI – v0.1.8
-- Consolas ocultas: todos los subprocesos Git/GH se ejecutan sin mostrar ventanas.
-- Auto-sync en rechazo non-fast-forward/fetch first (pull con rebase/autostash, fallback con
-  --allow-unrelated-histories y estrategia -X ours).
-- Creación automática del repo remoto (gh) si no existe.
-- Autodetecta carpeta del .exe como ruta del proyecto y nombre del repo.
-- Manejo de archivos grandes (GH001): ignora, untrack y limpia historial (filter-repo o filter-branch).
-- .gitignore y untrack de config/log/exe.
-- Status bar con countdown, guardado de config en config_autogit.json.
+Git Helper GUI – v0.1.9
+- Fix tildes/acentos: forzar UTF-8 en Git (i18n.*), en entorno (LC_ALL/LANG/LESSCHARSET)
+  y saneo automático del último mensaje si salió mojibake.
+- Consolas ocultas para subprocesos.
+- Auto-sync, creación de repo remoto si falta, autodetección de carpeta/ nombre de repo.
+- Manejo GH001, .gitignore/untrack, status bar con countdown, config persistente.
 """
 
 import os, sys, json, hashlib, threading, datetime, queue, traceback, subprocess, time
@@ -64,6 +61,22 @@ def bump_version(v):
         return f"{a}.{b}.{c}"
     except: return INITIAL_VERSION
 
+# ---------- Fix mojibake ----------
+def _unmojibake_if_needed(s):
+    """
+    Intenta corregir mojibake típico de decodificar UTF-8 como cp1252/latin1.
+    Si no aplica, devuelve s sin cambios.
+    """
+    try:
+        # patrón común: 'automÃ¡tica' -> 'automática'
+        fixed = s.encode("latin1").decode("utf-8")
+        # Heurística: si había 'Ã' en original y ahora hay tildes válidas, usamos fixed
+        if ("Ã" in s or "�" in s) and any(ch in fixed for ch in u"áéíóúñÁÉÍÓÚÑ"):
+            return fixed
+    except Exception:
+        pass
+    return s
+
 # ---------- Config ----------
 DEFAULT_CONFIG = {
     "version": INITIAL_VERSION,
@@ -78,7 +91,7 @@ DEFAULT_CONFIG = {
     # Proyecto / repo
     "project_path": app_dir(),
     "repo_name": "",
-    "follow_exe_folder": True,  # usar siempre la carpeta donde está el .exe/.py
+    "follow_exe_folder": True,
 
     # Git identity
     "git_user_name": "erickson558",
@@ -160,7 +173,7 @@ class App(tk.Tk):
             exe_dir = app_dir()
             self.project_path_var.set(exe_dir)
             self._on_project_path_change()
-            self._autodetect_repo_name()  # simula "Autodetectar"
+            self._autodetect_repo_name()
 
         try:
             self.geometry(self.cfg.get("window_geometry") or DEFAULT_CONFIG["window_geometry"])
@@ -395,7 +408,7 @@ class App(tk.Tk):
         path = filedialog.askopenfilename(
             initialdir=os.path.expanduser("~"),
             title="Selecciona tu clave privada",
-            filetypes=[("Claves", "*"), ("Todos", "*.*")],
+            filetypes=[("Claves", "*"), ("Todos", "*.*")]
         )
         if path:
             self.ssh_key_var.set(path)
@@ -445,7 +458,7 @@ class App(tk.Tk):
         self.countdown_var.set(f"Auto-cierre: {self.autoclose_remaining} s")
         self.countdown_job = self.after(1000, self._tick_countdown)
 
-    # ---------- Subprocess (oculto) ----------
+    # ---------- Subprocess helpers ----------
     def _startupinfo_flags(self):
         si = None; cf = 0
         if os.name == "nt":
@@ -458,6 +471,14 @@ class App(tk.Tk):
                 cf = 0
         return si, cf
 
+    def _utf8_env_overlay(self):
+        # Variables que fuerzan UTF-8 en Git/CLI (también útiles en Windows)
+        return {
+            "LC_ALL": "C.UTF-8",
+            "LANG": "C.UTF-8",
+            "LESSCHARSET": "utf-8"
+        }
+
     def _git_env(self, project_path):
         env = os.environ.copy()
         project_path = os.path.abspath(project_path)
@@ -469,28 +490,32 @@ class App(tk.Tk):
         env["GIT_PAGER"] = "cat"
         env["PAGER"] = "cat"
         env["GH_PAGER"] = "cat"
-        env["GIT_TERMINAL_PROMPT"] = "0"  # no abrir prompt para credenciales
-        env["GCM_INTERACTIVE"] = "Never"  # Git Credential Manager sin UI
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        env["GCM_INTERACTIVE"] = "Never"
         env["NO_COLOR"] = "1"
 
+        # Forzar UTF-8
+        env.update(self._utf8_env_overlay())
         return env
 
-    def _exe_exists(self, name):
-        for p in os.environ.get("PATH","").split(os.pathsep):
-            full=os.path.join(p, name + (".exe" if os.name=="nt" else ""))
-            if os.path.isfile(full): return True
-        return False
+    def _ensure_utf8_in_env(self, env):
+        if env is None:
+            env = os.environ.copy()
+        env.update(self._utf8_env_overlay())
+        return env
 
     def _run_cmd(self, args, cwd, stream=True, env=None):
         if not self.running: return 1
         si, cf = self._startupinfo_flags()
         if env is None and args and args[0] == "git" and cwd:
             env = self._git_env(cwd)
+        else:
+            env = self._ensure_utf8_in_env(env)
         try:
             p = subprocess.Popen(
                 args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace",
-                startupinfo=si, creationflags=cf, env=(env or os.environ.copy())
+                startupinfo=si, creationflags=cf, env=env
             )
             if stream:
                 for line in iter(p.stdout.readline, ""):
@@ -510,11 +535,13 @@ class App(tk.Tk):
         si, cf = self._startupinfo_flags()
         if env is None and args and args[0] == "git" and cwd:
             env = self._git_env(cwd)
+        else:
+            env = self._ensure_utf8_in_env(env)
         try:
             p = subprocess.Popen(
                 args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace",
-                startupinfo=si, creationflags=cf, env=(env or os.environ.copy())
+                startupinfo=si, creationflags=cf, env=env
             )
             out, _ = p.communicate()
             if out: self.worker_queue.put(("log", out.strip()))
@@ -527,10 +554,11 @@ class App(tk.Tk):
         si, cf = self._startupinfo_flags()
         if env is None and args and args[0] == "git" and cwd:
             env = self._git_env(cwd)
+        else:
+            env = self._ensure_utf8_in_env(env)
         return subprocess.check_output(
             args, cwd=cwd, text=True, encoding="utf-8", errors="replace",
-            stderr=subprocess.DEVNULL, startupinfo=si, creationflags=cf,
-            env=(env or os.environ.copy())
+            stderr=subprocess.DEVNULL, startupinfo=si, creationflags=cf, env=env
         )
 
     # ---------- Git helpers ----------
@@ -540,7 +568,7 @@ class App(tk.Tk):
             rc = subprocess.call(
                 ["git","rev-parse","--is-inside-work-tree"], cwd=path,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                startupinfo=si, creationflags=cf, env=self._git_env(path)
+                env=self._git_env(path), startupinfo=si, creationflags=cf
             )
             return rc == 0
         except Exception: return False
@@ -565,13 +593,20 @@ class App(tk.Tk):
             self.worker_queue.put(("log", f"Actualizando origin: {current} -> {url}"))
             self._run_cmd(["git","remote","set-url","origin", url], cwd=path)
 
+    def _exe_exists(self, name):
+        for p in os.environ.get("PATH","").split(os.pathsep):
+            full=os.path.join(p, name + (".exe" if os.name=="nt" else ""))
+            if os.path.isfile(full): return True
+        return False
+
     def _remote_exists(self, user, repo):
         if not self._exe_exists("gh"): return False
         si, cf = self._startupinfo_flags()
+        env = self._ensure_utf8_in_env(None)
         try:
             subprocess.check_output(["gh","repo","view", f"{user}/{repo}"],
                                     text=True, encoding="utf-8", errors="replace",
-                                    stderr=subprocess.DEVNULL, startupinfo=si, creationflags=cf)
+                                    stderr=subprocess.DEVNULL, startupinfo=si, creationflags=cf, env=env)
             return True
         except subprocess.CalledProcessError: return False
         except Exception: return False
@@ -579,9 +614,10 @@ class App(tk.Tk):
     def _gh_auth_status_ok(self):
         if not self._exe_exists("gh"): return False
         si, cf = self._startupinfo_flags()
+        env = self._ensure_utf8_in_env(None)
         try:
             subprocess.check_output(["gh","auth","status"], text=True, encoding="utf-8", errors="replace",
-                                    stderr=subprocess.DEVNULL, startupinfo=si, creationflags=cf)
+                                    stderr=subprocess.DEVNULL, startupinfo=si, creationflags=cf, env=env)
             return True
         except Exception: return False
 
@@ -589,11 +625,12 @@ class App(tk.Tk):
         if not self._exe_exists("gh"): return False
         if self._gh_auth_status_ok(): return True
         si, cf = self._startupinfo_flags()
+        env = self._ensure_utf8_in_env(None)
         try:
             p = subprocess.Popen(["gh","auth","login","--with-token"],
                                  text=True, encoding="utf-8", errors="replace",
                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                 startupinfo=si, creationflags=cf)
+                                 startupinfo=si, creationflags=cf, env=env)
             p.communicate(input=token+"\n", timeout=30)
             return p.returncode == 0
         except Exception as e:
@@ -813,32 +850,27 @@ class App(tk.Tk):
     # --- Auto-sync con remoto cuando push es rechazado ---
     def _sync_with_remote(self, project_path):
         self.worker_queue.put(("log", "Intentando sincronizar con remoto (fetch/pull)…"))
-        # Siempre aseguramos upstream
         self._run_cmd(["git","fetch","origin","main"], cwd=project_path)
         self._run_cmd(["git","branch","--set-upstream-to=origin/main","main"], cwd=project_path)
 
-        # 1) pull rebase con autostash
         rc = self._run_cmd(["git","pull","--rebase","--autostash","origin","main"], cwd=project_path)
         if rc == 0:
             self.worker_queue.put(("log", "pull --rebase exitoso."))
             return True
 
-        # 2) historias no relacionadas
-        self._run_cmd(["git","rebase","--abort"], cwd=project_path)  # por si quedó a medias
+        self._run_cmd(["git","rebase","--abort"], cwd=project_path)
         rc = self._run_cmd(["git","pull","origin","main","--allow-unrelated-histories","--no-edit"], cwd=project_path)
         if rc == 0:
             self.worker_queue.put(("log", "pull con --allow-unrelated-histories exitoso."))
             return True
 
-        # 3) estrategia que conserva local (ours)
-        self._run_cmd(["git","merge","--abort"], cwd=project_path)   # por si quedó a medias
+        self._run_cmd(["git","merge","--abort"], cwd=project_path)
         rc = self._run_cmd(["git","pull","-s","recursive","-X","ours","origin","main",
                             "--allow-unrelated-histories","--no-edit"], cwd=project_path)
         if rc == 0:
             self.worker_queue.put(("log", "pull con estrategia -X ours exitoso (se conserva local)."))
             return True
 
-        # Si nada funcionó, abortar y reportar
         self._run_cmd(["git","merge","--abort"], cwd=project_path)
         self._run_cmd(["git","rebase","--abort"], cwd=project_path)
         self.worker_queue.put(("log", "No se pudo sincronizar automáticamente con el remoto."))
@@ -853,7 +885,6 @@ class App(tk.Tk):
             text = (out or "").lower()
             self.worker_queue.put(("log", f"push intento {i}/{attempts} falló (rc={rc})"))
 
-            # Rechazo por non-fast-forward / fetch first
             if any(s in text for s in [
                 "fetch first", "non-fast-forward", "updates were rejected", "failed to push some refs"
             ]):
@@ -862,7 +893,6 @@ class App(tk.Tk):
                     if rc2 == 0: return 0
                     else: self.worker_queue.put(("log", "Push aún rechazado tras sincronizar."))
 
-            # GH001 / Large files
             if any(s in text for s in ["large files detected", "exceeds github's file size limit", "lfs", "gh001"]):
                 large_now = self._scan_large_files(project_path)
                 if large_now:
@@ -880,7 +910,6 @@ class App(tk.Tk):
                 else:
                     continue
 
-            # Timeouts / desconexiones
             if any(s in text for s in [
                 "http 408", "timeout", "timed out", "the remote end hung up unexpectedly",
                 "unexpected disconnect", "operation timed out", "curl 22", "rpc failed"
@@ -909,6 +938,35 @@ class App(tk.Tk):
                 self.worker_queue.put(("log", f"ERROR eliminando lock {lock}: {e}"))
         return False
 
+    # ---------- Git UTF-8 config & commit message check ----------
+    def _ensure_git_utf8_config(self, project_path):
+        """Configura Git para usar UTF-8 en commits y logs (idempotente)."""
+        steps = [
+            (["git","config","i18n.commitEncoding","utf-8"], "i18n.commitEncoding=utf-8"),
+            (["git","config","i18n.logOutputEncoding","utf-8"], "i18n.logOutputEncoding=utf-8"),
+            (["git","config","gui.encoding","utf-8"], "gui.encoding=utf-8"),
+            (["git","config","core.quotepath","false"], "core.quotepath=false"),
+        ]
+        for args, label in steps:
+            self._run_cmd(args, cwd=project_path)
+
+    def _read_last_commit_message(self, project_path):
+        try:
+            msg = self._run_check_output(["git","log","-1","--pretty=%B"], cwd=project_path)
+            return msg.strip()
+        except Exception:
+            return ""
+
+    def _maybe_fix_last_commit_message(self, project_path):
+        """Si el último mensaje parece mojibake, lo corrige con --amend."""
+        last = self._read_last_commit_message(project_path)
+        if not last:
+            return
+        fixed = _unmojibake_if_needed(last)
+        if fixed != last:
+            self.worker_queue.put(("log", f"Corregido mensaje de commit mojibake:\n  Antes: {last}\n  Ahora:  {fixed}"))
+            self._run_cmd(["git","commit","--amend","-m", fixed], cwd=project_path)
+
     # ---------- Pipeline principal ----------
     def _worker_pipeline(self, project_path, repo_name, commit_msg, create_readme):
         try:
@@ -929,10 +987,8 @@ class App(tk.Tk):
             first_time = not self._is_git_repo(project_path)
 
             if first_time:
-                # 1) init para crear .git
                 if self._run_cmd(["git","init"], cwd=project_path) != 0:
                     self.worker_queue.put(("log","ERROR en git init")); self.worker_queue.put(("done",None)); return
-                # 2) config LOCAL
                 identity_steps = [
                     (["git","config","user.name", git_name], "git config user.name"),
                     (["git","config","user.email", git_mail], "git config user.email"),
@@ -944,10 +1000,10 @@ class App(tk.Tk):
                 for args, label in identity_steps:
                     if self._run_cmd(args, cwd=project_path)!=0:
                         self.worker_queue.put(("log", f"ERROR en paso: {label}")); self.worker_queue.put(("done",None)); return
-                # 3) rama principal
+                # UTF-8 siempre
+                self._ensure_git_utf8_config(project_path)
                 self._run_cmd(["git","branch","-M","main"], cwd=project_path)
             else:
-                # repo ya existe: actualiza config local
                 identity_steps = [
                     (["git","config","user.name", git_name], "git config user.name"),
                     (["git","config","user.email", git_mail], "git config user.email"),
@@ -959,6 +1015,8 @@ class App(tk.Tk):
                 for args, label in identity_steps:
                     if self._run_cmd(args, cwd=project_path)!=0:
                         self.worker_queue.put(("log", f"ERROR en paso: {label}")); self.worker_queue.put(("done",None)); return
+                # Asegurar UTF-8 también en repos existentes
+                self._ensure_git_utf8_config(project_path)
                 self._run_cmd(["git","branch","-M","main"], cwd=project_path)
 
             # .gitignore + untrack básicos
@@ -987,14 +1045,13 @@ class App(tk.Tk):
                 if save_pat: self._save_pat_in_credential_manager(pat_user, pat_token)
                 if self._exe_exists("gh"): self._gh_login_with_token(pat_token)
 
-            # add / commit (primer commit si es primera vez)
+            # add / commit
             if first_time and self.cfg.get("create_readme_if_missing", True):
                 readme_path = os.path.join(project_path, "README.md")
                 if not os.path.exists(readme_path):
                     with open(readme_path,"w",encoding="utf-8") as f:
                         f.write(f"# {repo_name}\n\nProyecto {repo_name}.\n")
 
-            # Siempre agregamos todo
             rc = self._run_cmd(["git","add","."], cwd=project_path)
             if rc != 0:
                 if self._remove_index_lock_if_any(project_path):
@@ -1002,7 +1059,6 @@ class App(tk.Tk):
                 if rc != 0:
                     self.worker_queue.put(("log","ERROR en git add .")); self.worker_queue.put(("done",None)); return
 
-            # ¿Hay algo staged?
             si, cf = self._startupinfo_flags()
             rc_diff_cached = subprocess.call(
                 ["git","diff","--cached","--quiet"],
@@ -1022,13 +1078,18 @@ class App(tk.Tk):
             else:
                 if rc_diff_cached != 0:
                     commit_msg_use = (self.commit_message_var.get().strip() or "Actualización automática")
+                    # Asegurar que el texto que mandamos esté en buena forma
+                    commit_msg_use = _unmojibake_if_needed(commit_msg_use)
                     rc_commit = self._run_cmd(["git","commit","-m", commit_msg_use], cwd=project_path)
                     if rc_commit != 0:
                         self.worker_queue.put(("log","No hay cambios para commitear (post-inicial)."))
                 else:
                     self.worker_queue.put(("log","No hay cambios para commitear."))
 
-            # push (con reintentos + limpieza GH001 + auto-sync si es necesario)
+            # Verificar/Corregir mojibake del último commit si hicimos commit
+            self._maybe_fix_last_commit_message(project_path)
+
+            # push (con reintentos + limpieza GH001 + auto-sync)
             rc = self._git_push_with_retries(project_path, "origin", "main")
             if rc != 0:
                 self.worker_queue.put(("log","ERROR en push. Revisa remoto/credenciales.")); self.worker_queue.put(("done",None)); return
