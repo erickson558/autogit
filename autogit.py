@@ -1,25 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-Git Helper GUI – v0.2.2
-- FIX: Autenticación HTTPS y credenciales para primer push
-- FIX: Configuración automática de credential helper
-- FIX: Manejo robusto de errores de autenticación
-- Flujo robusto:
-  * Siempre hace add/commit ANTES de crear/asegurar remoto y hacer push.
-  * Si el remoto no existe: lo crea y luego sube el contenido.
-  * Si ya existe: sube cambios sólo si los hay.
-- Fix tildes/acentos: forzar UTF-8 en Git (i18n.*), entorno (LC_ALL/LANG/LESSCHARSET)
-  y saneo automático del último mensaje si salió mojibake.
-- Consolas ocultas para subprocesos. Auto-sync, creación de repo remoto si falta,
-  autodetección de carpeta/nombre de repo. Manejo GH001, .gitignore/untrack,
-  status bar con countdown, config persistente.
+Git Helper GUI – v0.2.3
+- FIX: Autenticación con PAT token obligatorio para HTTPS
+- FIX: Eliminada autenticación por password obsoleta
+- FIX: Mejor manejo de errores de GitHub
+- Flujo robusto con PAT token requerido
 """
 
 import os, sys, json, hashlib, threading, datetime, queue, traceback, subprocess, time
 
 try:
     import tkinter as tk
-    from tkinter import ttk, filedialog
+    from tkinter import ttk, filedialog, messagebox
 except Exception as e:
     print("Tkinter no disponible:", e); sys.exit(1)
 
@@ -100,11 +92,11 @@ DEFAULT_CONFIG = {
     "git_user_email": "erickson558@hotmail.com",
 
     # Autenticación: "gh" | "https_pat" | "ssh"
-    "auth_method": "gh",
+    "auth_method": "https_pat",
     "github_user": "erickson558",
 
-    # HTTPS + PAT
-    "pat_username": "github",
+    # HTTPS + PAT (OBLIGATORIO)
+    "pat_username": "erickson558",
     "pat_token": "",
     "pat_save_in_credential_manager": True,
 
@@ -218,9 +210,9 @@ class App(tk.Tk):
         m_app.add_separator()
         m_app.add_command(label="Salir", accelerator="Ctrl+Q", command=self.on_close)
         m_help = tk.Menu(menubar, tearoff=0)
-        m_help = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Ayuda", menu=m_help, underline=0)
         m_help.add_command(label="About", accelerator="F1", command=self._show_about)
+        m_help.add_command(label="Instrucciones PAT", accelerator="F2", command=self._show_pat_instructions)
 
     def _build_widgets(self):
         top = ttk.Frame(self); top.pack(fill="x", padx=16, pady=12)
@@ -281,13 +273,13 @@ class App(tk.Tk):
         e_ue.bind("<FocusOut>", lambda e: self._on_str_change("git_user_email", self.git_user_email_var.get()))
         e_ue.bind("<Return>",   lambda e: self._on_str_change("git_user_email", self.git_user_email_var.get()))
 
-        rowE = ttk.LabelFrame(body, text="Autenticación"); rowE.pack(fill="x", pady=(10,6))
+        rowE = ttk.LabelFrame(body, text="Autenticación GitHub (OBLIGATORIO)"); rowE.pack(fill="x", pady=(10,6))
         ttk.Label(rowE, text="Método:").grid(row=0, column=0, sticky="w", padx=6, pady=6)
-        self.auth_method_var = tk.StringVar(value=self.cfg.get("auth_method","gh"))
+        self.auth_method_var = tk.StringVar(value=self.cfg.get("auth_method","https_pat"))
         cb_auth = ttk.Combobox(rowE, textvariable=self.auth_method_var, state="readonly",
-                               values=["gh","https_pat","ssh"], width=12)
+                               values=["https_pat","ssh","gh"], width=12)
         cb_auth.grid(row=0, column=1, sticky="w", padx=6, pady=6)
-        cb_auth.bind("<<ComboboxSelected>>", lambda e: self._on_str_change("auth_method", self.auth_method_var.get()))
+        cb_auth.bind("<<ComboboxSelected>>", lambda e: self._on_auth_method_change())
         ttk.Label(rowE, text="Usuario GitHub:").grid(row=0, column=2, sticky="w", padx=(16,6))
         self.github_user_var = tk.StringVar(value=self.cfg.get("github_user",""))
         e_ghu = ttk.Entry(rowE, width=22, textvariable=self.github_user_var)
@@ -295,27 +287,33 @@ class App(tk.Tk):
         e_ghu.bind("<FocusOut>", lambda e: self._on_str_change("github_user", self.github_user_var.get()))
         e_ghu.bind("<Return>",   lambda e: self._on_str_change("github_user", self.github_user_var.get()))
 
-        ttk.Label(rowE, text="PAT usuario:").grid(row=1, column=0, sticky="w", padx=6, pady=6)
-        self.pat_user_var = tk.StringVar(value=self.cfg.get("pat_username","github"))
-        e_pu = ttk.Entry(rowE, width=20, textvariable=self.pat_user_var)
-        e_pu.grid(row=1, column=1, sticky="w", padx=6, pady=6)
-        e_pu.bind("<FocusOut>", lambda e: self._on_str_change("pat_username", self.pat_user_var.get()))
-        e_pu.bind("<Return>",   lambda e: self._on_str_change("pat_username", self.pat_user_var.get()))
-        ttk.Label(rowE, text="PAT token:").grid(row=1, column=2, sticky="w", padx=(16,6))
-        self._pat_shown = False
+        # PAT Token section - MÁS DESTACADO
+        pat_frame = ttk.Frame(rowE); pat_frame.grid(row=1, column=0, columnspan=5, sticky="we", padx=6, pady=6)
+        ttk.Label(pat_frame, text="🔑 PAT Token (OBLIGATORIO):", foreground="#FF6B6B").pack(side="left")
         self.pat_token_var = tk.StringVar(value=self.cfg.get("pat_token",""))
-        self.e_pt = ttk.Entry(rowE, width=30, textvariable=self.pat_token_var, show="•")
-        self.e_pt.grid(row=1, column=3, sticky="w", padx=6, pady=6)
+        self.e_pt = ttk.Entry(pat_frame, width=50, textvariable=self.pat_token_var, show="•")
+        self.e_pt.pack(side="left", padx=6, fill="x", expand=True)
+        self.e_pt.bind("<KeyRelease>", lambda e: self._on_str_change("pat_token", self.pat_token_var.get()))
+        
+        self._pat_shown = False
         def toggle_pat():
             self._pat_shown = not self._pat_shown
             self.e_pt.config(show="" if self._pat_shown else "•")
-        ttk.Button(rowE, text="Mostrar", width=10, command=toggle_pat).grid(row=1, column=4, sticky="w", padx=6)
-        self.e_pt.bind("<KeyRelease>", lambda e: self._on_str_change("pat_token", self.pat_token_var.get()))
+        ttk.Button(pat_frame, text="Mostrar", width=10, command=toggle_pat).pack(side="left", padx=6)
+        ttk.Button(pat_frame, text="Instrucciones", width=12, command=self._show_pat_instructions).pack(side="left", padx=6)
+
+        ttk.Label(rowE, text="PAT usuario:").grid(row=2, column=0, sticky="w", padx=6, pady=6)
+        self.pat_user_var = tk.StringVar(value=self.cfg.get("pat_username","erickson558"))
+        e_pu = ttk.Entry(rowE, width=20, textvariable=self.pat_user_var)
+        e_pu.grid(row=2, column=1, sticky="w", padx=6, pady=6)
+        e_pu.bind("<FocusOut>", lambda e: self._on_str_change("pat_username", self.pat_user_var.get()))
+        e_pu.bind("<Return>",   lambda e: self._on_str_change("pat_username", self.pat_user_var.get()))
+
         self.pat_save_var = tk.BooleanVar(value=self.cfg.get("pat_save_in_credential_manager", True))
         ttk.Checkbutton(rowE, text="Guardar token en Credential Manager (Windows)",
                         variable=self.pat_save_var,
                         command=lambda: self._on_bool_change("pat_save_in_credential_manager", self.pat_save_var.get())
-                        ).grid(row=2, column=0, columnspan=3, sticky="w", padx=6, pady=4)
+                        ).grid(row=2, column=2, columnspan=3, sticky="w", padx=6, pady=4)
 
         ttk.Label(rowE, text="Clave SSH (opcional):").grid(row=3, column=0, sticky="w", padx=6, pady=6)
         self.ssh_key_var = tk.StringVar(value=self.cfg.get("ssh_key_path",""))
@@ -324,6 +322,7 @@ class App(tk.Tk):
         e_sk.bind("<FocusOut>", lambda e: self._on_str_change("ssh_key_path", self.ssh_key_var.get()))
         e_sk.bind("<Return>",   lambda e: self._on_str_change("ssh_key_path", self.ssh_key_var.get()))
         ttk.Button(rowE, text="Examinar…", command=self._browse_ssh_key).grid(row=3, column=3, sticky="w", padx=6)
+        
         for i in range(5): rowE.grid_columnconfigure(i, weight=1)
 
         rowF = ttk.Frame(body); rowF.pack(fill="x", pady=(8,4))
@@ -357,14 +356,46 @@ class App(tk.Tk):
         self.countdown_var = tk.StringVar(value="")
         ttk.Label(status, textvariable=self.countdown_var, style="Status.TLabel").pack(side="right", padx=10)
 
+    def _on_auth_method_change(self):
+        method = self.auth_method_var.get()
+        self._on_str_change("auth_method", method)
+        if method == "https_pat":
+            self._status("Método: HTTPS con PAT Token (Recomendado)")
+        elif method == "ssh":
+            self._status("Método: SSH con clave privada")
+        elif method == "gh":
+            self._status("Método: GitHub CLI")
+
+    def _show_pat_instructions(self):
+        instructions = """🔑 CREAR PERSONAL ACCESS TOKEN (PAT) EN GITHUB:
+
+1. Ve a: https://github.com/settings/tokens
+2. Haz clic en "Generate new token" → "Generate new token (classic)"
+3. Pon un nombre descriptivo (ej: "AutoGit App")
+4. Selecciona estos permisos:
+   - ✅ repo (todo)
+   - ✅ workflow
+   - ✅ write:packages
+   - ✅ delete:packages
+5. Expiración: 90 días (recomendado)
+6. Haz clic en "Generate token"
+7. COPIA el token inmediatamente (solo se muestra una vez)
+8. Pega el token en el campo "PAT Token" de esta aplicación
+
+⚠️ IMPORTANTE: El token es como una contraseña, guárdalo de forma segura."""
+        
+        messagebox.showinfo("Instrucciones PAT Token", instructions)
+
     # ---------- Shortcuts / About ----------
     def _bind_shortcuts(self):
         self.bind_all("<Control-r>", lambda e: self._start_pipeline())
         self.bind_all("<Control-d>", lambda e: self._stop_pipeline())
         self.bind_all("<Control-q>", lambda e: self.on_close())
         self.bind_all("<F1>",        lambda e: self._show_about())
+        self.bind_all("<F2>",        lambda e: self._show_pat_instructions())
 
     def _show_about(self): AboutDialog(self, self.cfg.get("version", INITIAL_VERSION))
+
     def _status(self, txt):
         self.status_var.set(txt); self.cfg["status_text"]=txt; safe_write_json(CONFIG_PATH, self.cfg)
 
@@ -587,8 +618,10 @@ class App(tk.Tk):
         elif method == "https_pat":
             pat_token = self.pat_token_var.get().strip()
             if pat_token:
+                # URL con PAT token embebido - FORMA CORRECTA
                 return f"https://{github_user}:{pat_token}@github.com/{github_user}/{repo}.git"
             else:
+                # Sin token - probablemente falle
                 return f"https://github.com/{github_user}/{repo}.git"
         else:  # gh
             return f"https://github.com/{github_user}/{repo}.git"
@@ -648,13 +681,29 @@ class App(tk.Tk):
             self.worker_queue.put(("log", f"ERROR gh auth login: {e}")); return False
 
     def _create_remote(self, owner_repo, project_path):
-        """Crea el repo remoto sin tocar origin directamente."""
-        if not self._exe_exists("gh"): return False
+        """Crea el repo remoto usando GitHub CLI con autenticación por token"""
+        if not self._exe_exists("gh"): 
+            self.worker_queue.put(("log", "GitHub CLI no disponible, no se puede crear repo remoto"))
+            return False
+        
+        # Verificar autenticación primero
+        if not self._gh_auth_status_ok():
+            pat_token = self.pat_token_var.get().strip()
+            if pat_token:
+                self.worker_queue.put(("log", "Autenticando GitHub CLI con token…"))
+                if not self._gh_login_with_token(pat_token):
+                    self.worker_queue.put(("log", "❌ No se pudo autenticar GitHub CLI"))
+                    return False
+            else:
+                self.worker_queue.put(("log", "❌ No hay PAT token para autenticar GitHub CLI"))
+                return False
+        
         self.worker_queue.put(("log", f"Creando repo remoto: {owner_repo} (public)…"))
-        rc = self._run_cmd(["gh", "repo", "create", owner_repo, "--public"], cwd=project_path)
+        rc = self._run_cmd(["gh", "repo", "create", owner_repo, "--public", "--confirm"], cwd=project_path)
         if rc == 0:
             self._ensure_origin(project_path, self._build_origin("gh", owner_repo.split("/")[0], owner_repo.split("/")[1]))
-        return rc == 0
+            return True
+        return False
 
     def _save_pat_in_credential_manager(self, user, token):
         self.worker_queue.put(("log", "PAT no se persiste automáticamente (stub)."))
@@ -883,39 +932,59 @@ class App(tk.Tk):
     def _setup_credentials(self, project_path, method):
         """Configura las credenciales según el método de autenticación"""
         if method == "https_pat":
-            # Configurar credential helper para evitar prompts
-            self._run_cmd(["git", "config", "credential.helper", "store"], cwd=project_path)
-            self._run_cmd(["git", "config", "credential.useHttpPath", "true"], cwd=project_path)
-            
-            # Si hay PAT token, configurar la URL con credenciales embebidas
             pat_token = self.pat_token_var.get().strip()
-            if pat_token:
-                github_user = self.github_user_var.get().strip()
-                repo_name = self.repo_name_var.get().strip()
-                origin_url = f"https://{github_user}:{pat_token}@github.com/{github_user}/{repo_name}.git"
-                self._ensure_origin(project_path, origin_url)
+            if not pat_token:
+                self.worker_queue.put(("log", "❌ ERROR: No hay PAT token configurado"))
+                self.worker_queue.put(("log", "💡 Ve a GitHub Settings > Tokens y crea un PAT token"))
+                return False
+            
+            github_user = self.github_user_var.get().strip()
+            repo_name = self.repo_name_var.get().strip()
+            
+            # Configurar origin con PAT token embebido
+            origin_url = f"https://{github_user}:{pat_token}@github.com/{github_user}/{repo_name}.git"
+            self._ensure_origin(project_path, origin_url)
+            
+            # Configurar credential helper
+            self._run_cmd(["git", "config", "credential.helper", "store"], cwd=project_path)
+            self.worker_queue.put(("log", "✅ Credenciales configuradas con PAT token"))
+            return True
         
         elif method == "gh":
-            # Verificar autenticación de GitHub CLI
             if not self._gh_auth_status_ok():
-                self.worker_queue.put(("log", "⚠️ GitHub CLI no autenticado. Intentando autenticar…"))
-                # Intentar autenticar con token si está disponible
                 pat_token = self.pat_token_var.get().strip()
                 if pat_token:
-                    self._gh_login_with_token(pat_token)
+                    self.worker_queue.put(("log", "Autenticando GitHub CLI con token…"))
+                    if self._gh_login_with_token(pat_token):
+                        self.worker_queue.put(("log", "✅ GitHub CLI autenticado"))
+                    else:
+                        self.worker_queue.put(("log", "❌ No se pudo autenticar GitHub CLI"))
                 else:
-                    self.worker_queue.put(("log", "❌ No hay token PAT disponible para autenticar GitHub CLI"))
+                    self.worker_queue.put(("log", "❌ No hay PAT token para autenticar GitHub CLI"))
+            return True
         
-        # Configuración común para evitar prompts
-        self._run_cmd(["git", "config", "core.askPass", "echo"], cwd=project_path)
+        elif method == "ssh":
+            self.worker_queue.put(("log", "✅ Usando autenticación SSH"))
+            return True
+        
+        return True
 
     # --- Push con reintentos + GH001 + non-fast-forward ---
     def _git_push_with_retries(self, project_path, origin="origin", branch="main"):
         attempts = 3
-        method = self.auth_method_var.get().strip() or "gh"
+        method = self.auth_method_var.get().strip() or "https_pat"
         
+        # Verificar PAT token para HTTPS
+        if method == "https_pat":
+            pat_token = self.pat_token_var.get().strip()
+            if not pat_token:
+                self.worker_queue.put(("log", "❌ ERROR: No hay PAT token configurado"))
+                self.worker_queue.put(("log", "💡 Usa F2 para ver instrucciones de cómo crear un PAT token"))
+                return 1
+
         # Configurar credenciales antes del primer intento
-        self._setup_credentials(project_path, method)
+        if not self._setup_credentials(project_path, method):
+            return 1
 
         for i in range(1, attempts + 1):
             rc, out = self._run_cmd_capture(["git", "push", "-u", origin, branch], project_path)
@@ -968,24 +1037,15 @@ class App(tk.Tk):
                 continue
             
             # Manejo específico de errores de autenticación
-            if any(s in text for s in ["authentication failed", "could not read username", "terminal prompts disabled"]):
+            if any(s in text for s in ["authentication failed", "could not read username", "terminal prompts disabled", "invalid username or token"]):
                 self.worker_queue.put(("log", "🔐 Error de autenticación detectado"))
-                if method == "https_pat":
-                    pat_token = self.pat_token_var.get().strip()
-                    if pat_token:
-                        github_user = self.github_user_var.get().strip()
-                        repo_name = self.repo_name_var.get().strip()
-                        # Reconfigurar origin con credenciales embebidas
-                        origin_url = f"https://{github_user}:{pat_token}@github.com/{github_user}/{repo_name}.git"
-                        self._ensure_origin(project_path, origin_url)
-                        self.worker_queue.put(("log", "🔄 Reconfigurado origin con credenciales embebidas"))
-                    else:
-                        self.worker_queue.put(("log", "❌ No hay PAT token configurado para autenticación HTTPS"))
-                elif method == "gh":
-                    self.worker_queue.put(("log", "❌ GitHub CLI no está autenticado. Ejecuta 'gh auth login' manualmente"))
                 
-                # Intentar con store credential como fallback
-                self._run_cmd(["git", "config", "credential.helper", "store"], cwd=project_path)
+                if method == "https_pat":
+                    self.worker_queue.put(("log", "❌ El PAT token puede ser inválido o no tener permisos suficientes"))
+                    self.worker_queue.put(("log", "💡 Verifica que el token tenga permisos 'repo' y no haya expirado"))
+                
+                # Reconfigurar credenciales
+                self._setup_credentials(project_path, method)
     
             break
 
@@ -1040,12 +1100,16 @@ class App(tk.Tk):
             
             git_name = self.git_user_name_var.get().strip()
             git_mail = self.git_user_email_var.get().strip()
-            method   = self.auth_method_var.get().strip() or "gh"
+            method   = self.auth_method_var.get().strip() or "https_pat"
             gh_user  = self.github_user_var.get().strip()
 
-            # Verificar GitHub CLI si se usa ese método
-            if method == "gh" and not self._exe_exists("gh"):
-                self.worker_queue.put(("log","ADVERTENCIA: GitHub CLI (gh) no está en PATH. Se intentará push directo."))
+            # Verificar PAT token para HTTPS
+            if method == "https_pat":
+                pat_token = self.pat_token_var.get().strip()
+                if not pat_token:
+                    self.worker_queue.put(("log","❌ ERROR: No hay PAT token configurado"))
+                    self.worker_queue.put(("log","💡 Usa F2 para ver instrucciones de cómo crear un PAT token"))
+                    self.worker_queue.put(("done",None)); return
 
             first_time = not self._is_git_repo(project_path)
 
@@ -1142,8 +1206,8 @@ class App(tk.Tk):
                 owner_repo = f"{gh_user}/{repo_name}"
                 if self._exe_exists("gh"):
                     if not self._create_remote(owner_repo, project_path):
-                        self.worker_queue.put(("log","❌ No se pudo crear el repo remoto automáticamente"))
-                        # Continuar de todas formas, el usuario puede crearlo manualmente
+                        self.worker_queue.put(("log","⚠️ No se pudo crear el repo remoto automáticamente"))
+                        self.worker_queue.put(("log","💡 Crea el repo manualmente en GitHub.com"))
                 else:
                     self.worker_queue.put(("log","ℹ️ GitHub CLI no disponible, asumiendo repo remoto existe"))
             else:
@@ -1156,7 +1220,7 @@ class App(tk.Tk):
             self.worker_queue.put(("log","🚀 Subiendo cambios al repositorio remoto…"))
             rc = self._git_push_with_retries(project_path, "origin", "main")
             if rc != 0:
-                self.worker_queue.put(("log","❌ ERROR en push. Revisa remoto/credenciales.")); self.worker_queue.put(("done",None)); return
+                self.worker_queue.put(("log","❌ ERROR en push. Revisa credenciales y conexión.")); self.worker_queue.put(("done",None)); return
 
             self.worker_queue.put(("stat","✅ Pipeline completado exitosamente"))
 
@@ -1176,6 +1240,16 @@ class App(tk.Tk):
         if not repo:
             self._autodetect_repo_name(); repo=self.repo_name_var.get().strip()
             if not repo: self._status("No se pudo determinar el nombre del repo."); return
+        
+        # Verificar PAT token antes de iniciar
+        method = self.auth_method_var.get().strip() or "https_pat"
+        if method == "https_pat" and not self.pat_token_var.get().strip():
+            self._status("ERROR: Configura un PAT token primero (F2 para instrucciones)")
+            messagebox.showerror("PAT Token Requerido", 
+                               "Debes configurar un Personal Access Token (PAT) de GitHub.\n\n" 
+                               "Presiona F2 para ver instrucciones de cómo crear uno.")
+            return
+        
         self.running=True; self.btn_run.config(state="disabled"); self.btn_stop.config(state="normal")
         self._status("Ejecutando pipeline…")
         self._append_log(f"Iniciando pipeline en: {proj} (repo: {repo})")
