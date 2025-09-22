@@ -639,7 +639,11 @@ class App(tk.Tk):
         """Crea el repo remoto y configura 'origin' (no empuja aquí)."""
         if not self._exe_exists("gh"): return False
         self.worker_queue.put(("log", f"Creando repo remoto: {owner_repo} (public)…"))
-        rc = self._run_cmd(["gh", "repo", "create", owner_repo, "--public", "--source", ".", "--remote", "origin"], cwd=project_path)
+        
+        rc = self._run_cmd(["gh", "repo", "create", owner_repo, "--public"], cwd=project_path)
+        if rc == 0:
+            self._ensure_origin(project_path, self._build_origin("gh", owner_repo.split("/")[0], owner_repo.split("/")[1]))
+
         return rc == 0
 
     def _save_pat_in_credential_manager(self, user, token):
