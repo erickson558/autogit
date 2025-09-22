@@ -871,47 +871,66 @@ class App(tk.Tk):
     # --- Push con reintentos + GH001 + non-fast-forward ---
     def _git_push_with_retries(self, project_path, origin="origin", branch="main"):
         attempts = 3
-        for i in range(1, attempts+1):
-            rc, out = self._run_cmd_capture(["git","push","-u",origin,branch], project_path)
-            if rc == 0: return 0
+        method = self.auth_method_var.get().strip() or "gh"
+    
+        # Verifica si estás autenticado con GitHub CLI
+        if method == "gh" and not self._gh_auth_status_ok():
+            self.worker_queue.put(("log", "⚠️ GitHub CLI no está autenticado. Ejecuta en consola: gh auth login"))
+    
+        # Verifica si estás usando HTTPS sin token
+        origin_url = self._remote_url(project_path)
+        if method.startswith("https") and "@" not in origin_url:
+            self.worker_queue.put(("log", "⚠️ Estás usando HTTPS pero no se detectó token embebido en la URL ni autenticación interactiva."))
+            self.worker_queue.put(("log", "👉 Solución: Ejecuta 'gh auth login' o cambia a autenticación por SSH."))
+
+        for i in range(1, attempts + 1):
+            rc, out = self._run_cmd_capture(["git", "push", "-u", origin, branch], project_path)
+            if rc == 0:
+                return 0
+    
             text = (out or "").lower()
             self.worker_queue.put(("log", f"push intento {i}/{attempts} falló (rc={rc})"))
-
+    
             if any(s in text for s in ["fetch first", "non-fast-forward", "updates were rejected", "failed to push some refs"]):
                 if self._sync_with_remote(project_path):
-                    rc2, _ = self._run_cmd_capture(["git","push","-u",origin,branch], project_path)
-                    if rc2 == 0: return 0
-                    else: self.worker_queue.put(("log", "Push aún rechazado tras sincronizar."))
-
+                    rc2, _ = self._run_cmd_capture(["git", "push", "-u", origin, branch], project_path)
+                    if rc2 == 0:
+                        return 0
+                    else:
+                        self.worker_queue.put(("log", "Push aún rechazado tras sincronizar."))
+        
             if any(s in text for s in ["large files detected", "exceeds github's file size limit", "lfs", "gh001"]):
                 large_now = self._scan_large_files(project_path)
                 if large_now:
                     self._append_gitignore_patterns(project_path, large_now)
                     self._untrack_list(project_path, large_now)
-                    self._run_cmd(["git","add",".gitignore"], cwd=project_path)
-                    self._run_cmd(["git","commit","--amend","-C","HEAD"], cwd=project_path)
+                    self._run_cmd(["git", "add", ".gitignore"], cwd=project_path)
+                    self._run_cmd(["git", "commit", "--amend", "-C", "HEAD"], cwd=project_path)
                 purge_patterns = list(set(self.cfg.get("history_purge_patterns", ["autogit.exe"]) + large_now))
                 if not self._purge_history_paths(project_path, purge_patterns):
                     return rc
                 if self.cfg.get("force_push_after_purge", True):
-                    self._run_cmd(["git","push","--force","--prune",origin,"+refs/heads/*:refs/heads/*"], cwd=project_path)
-                    self._run_cmd(["git","push","--force","--prune",origin,"+refs/tags/*:refs/tags/*"], cwd=project_path)
+                    self._run_cmd(["git", "push", "--force", "--prune", origin, "+refs/heads/*:refs/heads/*"], cwd=project_path)
+                    self._run_cmd(["git", "push", "--force", "--prune", origin, "+refs/tags/*:refs/tags/*"], cwd=project_path)
                     return 0
                 else:
                     continue
-
+        
             if any(s in text for s in ["http 408", "timeout", "timed out", "the remote end hung up unexpectedly",
-                                       "unexpected disconnect", "operation timed out", "curl 22", "rpc failed"]):
-                self._run_cmd(["git","config","http.version","HTTP/1.1"], cwd=project_path)
-                self._run_cmd(["git","config","http.postBuffer","524288000"], cwd=project_path)
-                self._run_cmd(["git","config","http.lowSpeedLimit","0"], cwd=project_path)
-                self._run_cmd(["git","config","http.lowSpeedTime","0"], cwd=project_path)
-                self._run_cmd(["git","repack","-ad","-f","--depth=1","--window=1"], cwd=project_path)
-                self._run_cmd(["git","gc","--prune=now"], cwd=project_path)
-                time.sleep(2*i); continue
-
+                                        "unexpected disconnect", "operation timed out", "curl 22", "rpc failed"]):
+                self._run_cmd(["git", "config", "http.version", "HTTP/1.1"], cwd=project_path)
+                self._run_cmd(["git", "config", "http.postBuffer", "524288000"], cwd=project_path)
+                self._run_cmd(["git", "config", "http.lowSpeedLimit", "0"], cwd=project_path)
+                self._run_cmd(["git", "config", "http.lowSpeedTime", "0"], cwd=project_path)
+                self._run_cmd(["git", "repack", "-ad", "-f", "--depth=1", "--window=1"], cwd=project_path)
+                self._run_cmd(["git", "gc", "--prune=now"], cwd=project_path)
+                time.sleep(2 * i)
+                continue
+    
             break
+
         return rc
+
 
     # ---------- Locks ----------
     def _remove_index_lock_if_any(self, path):
