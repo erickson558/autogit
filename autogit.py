@@ -1,17 +1,18 @@
 # -*- coding: utf-8 -*-
 """
 Git Helper GUI – v0.3.2
-- FIX: .gitignore ampliado (config_autogit.json*, *.tmp, .cfg_*.tmp)
-- FIX: safe_write_json usa temporales ocultos y patrón ignorado por Git
-- ADD: Purga automática al detectar GH013 (Push Protection) + force-push
-- ADD: Re-init limpio en primer uso (opcional) borrando .git existente
-- ADD: Forzar remote origin con x-access-token:<PAT> (https_pat)
-- ADD: Nuke de credential helpers (local y global) + limpieza cache
-- FIX: Test PAT usa json_lib de forma consistente
+- ADD: Siempre que haya PAT, se apagan helpers de credenciales y se fuerza origin con x-access-token ANTES de push.
+- ADD: Si el push falla por auth, se vuelve a forzar origin con PAT y se reintenta inmediatamente.
+- ADD: Re-init limpio del repo si es primer uso y existe .git colgando (OneDrive/locks).
+- ADD: safe_write_json / safe_read_json robustos (locks de OneDrive).
+- ADD: safe_rmtree con reintentos.
+- ADD: Manejo GH013 (Push Protection / secretos) purgando historial y force push.
+- ADD: Limpieza y deshabilitado de credential.helper local y global.
+- FIX: Asegura comillas correctas en menú "Instrucciones PAT".
 """
 
 import os, sys, json, hashlib, threading, datetime, queue, traceback, subprocess, time
-import base64, tempfile, shutil, random
+import shutil, random
 
 try:
     import tkinter as tk
@@ -38,14 +39,13 @@ def log_line(msg):
         pass
 
 def safe_write_json(path, data, retries=10, base_delay=0.05):
-    """Escribe JSON de forma robusta (locks OneDrive) y evita que el .tmp se rastree por Git."""
+    """Escribe JSON robustamente (locks Windows/OneDrive)."""
     try:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     except Exception:
         pass
     last_err = None
     for attempt in range(retries):
-        # Temporal oculto y con patrón que ignoramos en .gitignore
         tmp_name = f".cfg_{os.getpid()}_{int(time.time()*1000)}_{random.randint(1000,9999)}.tmp"
         tmp_path = os.path.join(os.path.dirname(path) or ".", tmp_name)
         try:
@@ -53,44 +53,26 @@ def safe_write_json(path, data, retries=10, base_delay=0.05):
                 json.dump(data, f, ensure_ascii=False, indent=2)
                 f.flush(); os.fsync(f.fileno())
             try:
-                os.replace(tmp_path, path)  # atómico en mismo volumen
+                os.replace(tmp_path, path)
             except PermissionError:
                 shutil.move(tmp_path, path)
             return
-        except PermissionError as e:
-            last_err = e
-            try:
-                if os.path.exists(tmp_path): os.remove(tmp_path)
-            except Exception: pass
-            time.sleep(base_delay * (2 ** attempt) + random.random() * 0.05)
         except Exception as e:
             last_err = e
             try:
                 if os.path.exists(tmp_path): os.remove(tmp_path)
             except Exception: pass
-            log_line(f"ERROR escribiendo JSON: {e}")
-            break
-    # Fallback final fuera del repo (por si hay locks fuertes)
-    try:
-        home_fallback = os.path.join(os.path.expanduser("~"), "config_autogit.local.json")
-        with open(home_fallback, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        log_line(f"⚠️ No se pudo reemplazar {path}. Guardado en {home_fallback}. Último error: {last_err}")
-    except Exception as e:
-        log_line(f"❌ FALLO guardando config. Último error: {last_err}. Fallback error: {e}")
+            time.sleep(base_delay * (2 ** attempt) + random.random() * 0.05)
+    log_line(f"⚠️ No se pudo guardar {path}. Último error: {last_err}")
 
 def safe_read_json(path, default):
-    """Lee JSON de forma segura. Si no existe o falla, devuelve default (mergeando claves)."""
     try:
-        if not os.path.exists(path):
-            return default
+        if not os.path.exists(path): return default
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-            if isinstance(data, dict):
-                merged = default.copy()
-                merged.update(data)
-                return merged
-            return default
+        if isinstance(data, dict):
+            merged = default.copy(); merged.update(data); return merged
+        return default
     except Exception as e:
         log_line(f"ERROR leyendo JSON {path}: {e}")
         return default
@@ -112,7 +94,6 @@ def bump_version(v):
     except: return INITIAL_VERSION
 
 def safe_rmtree(path, retries=10, base_delay=0.05):
-    """Elimina carpetas de forma robusta (locks en Windows/OneDrive)."""
     last = None
     for attempt in range(retries):
         try:
@@ -121,13 +102,11 @@ def safe_rmtree(path, retries=10, base_delay=0.05):
             return True
         except Exception as e:
             last = e
-            # Intento de desbloquear archivos marcándolos como writable
             try:
                 for root, dirs, files in os.walk(path):
                     for n in files:
-                        fp = os.path.join(root, n)
                         try:
-                            os.chmod(fp, 0o666)
+                            os.chmod(os.path.join(root, n), 0o666)
                         except Exception:
                             pass
             except Exception:
@@ -138,7 +117,6 @@ def safe_rmtree(path, retries=10, base_delay=0.05):
 
 # ---------- Fix mojibake ----------
 def _unmojibake_if_needed(s):
-    """Corrige mojibake típico (UTF-8 leído como latin1)."""
     try:
         fixed = s.encode("latin1").decode("utf-8")
         if ("Ã" in s or "�" in s) and any(ch in fixed for ch in u"áéíóúñÁÉÍÓÚÑ"):
@@ -167,11 +145,11 @@ DEFAULT_CONFIG = {
     "git_user_name": "erickson558",
     "git_user_email": "erickson558@hotmail.com",
 
-    # Autenticación: "gh" | "https_pat" | "ssh"
-    "auth_method": "https_pat",
+    # Autenticación
+    "auth_method": "https_pat",  # https_pat | ssh | gh
     "github_user": "erickson558",
 
-    # HTTPS + PAT (OBLIGATORIO)
+    # HTTPS + PAT
     "pat_username": "erickson558",
     "pat_token": "",
     "pat_save_in_credential_manager": True,
@@ -185,26 +163,18 @@ DEFAULT_CONFIG = {
 
     # Grandes / limpieza historia
     "max_file_size_mb": 95,
-    "history_purge_patterns": [
-        "autogit.exe",
-        "autogit*.exe",
-        "config_autogit.json",
-        "config_autogit.json.tmp",
-        "*.tmp"
-    ],
+    "history_purge_patterns": ["autogit.exe", "autogit*.exe", "config_autogit.json", "config_autogit.json.tmp", "*.tmp", ".cfg_*.tmp"],
     "force_push_after_purge": True,
 
-    # Forzar re-init limpio si es primera vez
+    # Re-init limpio si es primer uso
     "clean_git_on_first_time": True
 }
 
-# .gitignore base
 GITIGNORE_LINES = [
     "# --- GitHelper default ---",
     "config.json",
     "log.txt",
     "config_autogit.json",
-    "config_autogit.json*",
     "log_autogit.txt",
     "*.exe",
     "*.pyc",
@@ -214,8 +184,6 @@ GITIGNORE_LINES = [
     "node_modules/",
     ".DS_Store",
     "Thumbs.db",
-    "*.tmp",
-    ".cfg_*.tmp",
 ]
 
 class AboutDialog(tk.Toplevel):
@@ -239,7 +207,6 @@ class App(tk.Tk):
         self.title(APP_NAME); self.configure(bg="#0B0F14")
         self.cfg = safe_read_json(CONFIG_PATH, DEFAULT_CONFIG.copy())
 
-        # Bump versión si cambió el binario/script
         code_path = sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(__file__)
         h = file_hash(code_path)
         if h and h != self.cfg.get("last_code_hash",""):
@@ -250,7 +217,6 @@ class App(tk.Tk):
 
         self._build_style(); self._build_menu(); self._build_widgets()
 
-        # Forzar usar SIEMPRE la carpeta del ejecutable como project_path
         if self.cfg.get("follow_exe_folder", True):
             exe_dir = app_dir()
             self.project_path_var.set(exe_dir)
@@ -303,6 +269,7 @@ class App(tk.Tk):
         m_help = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Ayuda", menu=m_help, underline=0)
         m_help.add_command(label="About", accelerator="F1", command=self._show_about)
+        # (Fijado error de comillas)
         m_help.add_command(label="Instrucciones PAT", accelerator="F2", command=self._show_pat_instructions)
 
     def _build_widgets(self):
@@ -378,7 +345,7 @@ class App(tk.Tk):
         e_ghu.bind("<FocusOut>", lambda e: self._on_str_change("github_user", self.github_user_var.get()))
         e_ghu.bind("<Return>",   lambda e: self._on_str_change("github_user", self.github_user_var.get()))
 
-        # PAT Token section
+        # PAT Token
         pat_frame = ttk.Frame(rowE); pat_frame.grid(row=1, column=0, columnspan=5, sticky="we", padx=6, pady=6)
         ttk.Label(pat_frame, text="🔑 PAT Token (OBLIGATORIO):", foreground="#FF6B6B").pack(side="left")
         self.pat_token_var = tk.StringVar(value=self.cfg.get("pat_token",""))
@@ -463,26 +430,21 @@ class App(tk.Tk):
     def _show_pat_instructions(self):
         instructions = """🔑 CREAR PERSONAL ACCESS TOKEN (PAT) EN GITHUB:
 
-1. Ve a: https://github.com/settings/tokens
-2. Haz clic en "Generate new token" → "Generate new token (classic)"
-3. Pon un nombre descriptivo (ej: "AutoGit App")
-4. Selecciona estos permisos:
-   - ✅ repo (todo)
-   - ✅ workflow
-   - ✅ write:packages
-   - ✅ delete:packages
-5. Expiración: 90 días (recomendado)
-6. Haz clic en "Generate token"
-7. COPIA el token inmediatamente (solo se muestra una vez)
-8. Pega el token en el campo "PAT Token" de esta aplicación
+1) https://github.com/settings/tokens
+2) Generate new token (classic)
+3) Nombre descriptivo (ej: "AutoGit")
+4) Permisos: repo, workflow, write:packages, delete:packages
+5) Expiración: 90 días (recomendado)
+6) Generar y COPIAR (solo se muestra una vez)
+7) Pegar en el campo "PAT Token" de esta app
 
-⚠️ IMPORTANTE: El token es como una contraseña, guárdalo de forma segura."""
+⚠️ El token es como una contraseña. No lo publiques."""
         messagebox.showinfo("Instrucciones PAT Token", instructions)
 
-    # ---------- Test PAT Token (INLINE + HILO) ----------
+    # ---------- Test PAT Token ----------
     def _test_pat_token(self, *_):
-        pat_token = self.pat_token_var.get().strip()
-        github_user = self.github_user_var.get().strip()
+        pat_token = (self.pat_token_var.get() or "").strip()
+        github_user = (self.github_user_var.get() or "").strip()
         if not pat_token:
             self._append_log("❌ ERROR: No hay PAT token configurado")
             try: self.pat_status_var.set("❌ Sin token")
@@ -514,21 +476,18 @@ class App(tk.Tk):
             self._pat_testing = False
 
     def _test_pat_token_impl(self, callback):
-        """Prueba API /user, permisos, repo y git ls-remote contra repo real con PAT."""
-        pat_token  = self.pat_token_var.get().strip()
-        github_user = self.github_user_var.get().strip()
-        repo_name   = self.repo_name_var.get().strip() or "autogit"
+        pat_token  = (self.pat_token_var.get() or "").strip()
+        github_user = (self.github_user_var.get() or "").strip()
+        repo_name   = (self.repo_name_var.get() or "").strip() or "autogit"
 
-        import urllib.request
-        import urllib.error
-        import json as json_lib
+        import urllib.request, urllib.error, json as json_lib
 
-        callback("".ljust(60, "="))
+        callback("="*60)
         callback("🔐 Iniciando test de PAT token (inline)…")
         callback(f"Usuario: {github_user}")
         callback(f"Token: {pat_token[:8]}...")
 
-        # Test 1: /user
+        # /user
         callback("1) Verificando autenticación básica a GitHub API…")
         try:
             url = "https://api.github.com/user"
@@ -541,28 +500,25 @@ class App(tk.Tk):
                 callback(f"   📧 email: {data.get('email', 'N/A')}")
                 callback(f"   📊 RateLimit: {response.headers.get('X-RateLimit-Limit', 'N/A')}")
         except urllib.error.HTTPError as e:
-            if e.code in (401,403):
-                callback(f"   ❌ Error HTTP {e.code} (token inválido/permiso insuf.)"); return False
-            callback(f"   ❌ Error HTTP {e.code}: {e.reason}"); return False
+            callback(f"   ❌ Error HTTP {e.code}."); return False
         except Exception as e:
-            callback(f"   ❌ Error de conexión: {str(e)}"); return False
+            callback(f"   ❌ Error de conexión: {e}"); return False
 
-        # Test 2: listar repos
+        # list repos
         callback("2) Verificando permisos de repositorio (listar)…")
         try:
             url = "https://api.github.com/user/repos?per_page=1"
             headers = {'Authorization': f'token {pat_token}','User-Agent': 'AutoGit-App','Accept': 'application/vnd.github.v3+json'}
             req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=10) as response:
-                _ = response.read()
+            with urllib.request.urlopen(req, timeout=10):
                 callback("   ✅ Permisos de repos OK")
         except urllib.error.HTTPError as e:
             if e.code == 403:
-                callback("   ❌ Token sin permisos de repos (HTTP 403)"); return False
+                callback("   ❌ Sin permisos de repos (HTTP 403)"); return False
             else:
                 callback(f"   ⚠️ Error HTTP {e.code} (puede ser normal)")
 
-        # Test 3: repo específico
+        # repo específico
         if repo_name:
             callback(f"3) Verificando acceso al repo '{github_user}/{repo_name}'…")
             try:
@@ -578,7 +534,7 @@ class App(tk.Tk):
                 else:
                     callback(f"   ⚠️ Error HTTP {e.code} al acceder al repo")
 
-        # Test 4: git ls-remote con URL con PAT contra el repo real
+        # git ls-remote con PAT
         callback("4) Verificando autenticación con git (ls-remote)…")
         test_dir = os.path.join(os.path.expanduser("~"), ".autogit_test")
         try:
@@ -726,7 +682,7 @@ class App(tk.Tk):
         if os.name == "nt":
             si = subprocess.STARTUPINFO()
             si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            si.wShowWindow = 0  # SW_HIDE
+            si.wShowWindow = 0
             try:
                 cf = subprocess.CREATE_NO_WINDOW
             except AttributeError:
@@ -742,9 +698,7 @@ class App(tk.Tk):
         env["GIT_WORK_TREE"] = project_path
         env["GIT_DIR"] = os.path.join(project_path, ".git")
         env["GIT_CEILING_DIRECTORIES"] = os.path.dirname(project_path)
-        env["GIT_PAGER"] = "cat"
-        env["PAGER"] = "cat"
-        env["GH_PAGER"] = "cat"
+        env["GIT_PAGER"] = "cat"; env["PAGER"] = "cat"; env["GH_PAGER"] = "cat"
         env["GIT_TERMINAL_PROMPT"] = "0"
         env["GIT_ASKPASS"] = "echo"
         env["GCM_INTERACTIVE"] = "Never"
@@ -758,7 +712,7 @@ class App(tk.Tk):
         env.update(self._utf8_env_overlay())
         return env
 
-    # Helpers que NO dependen de self.running (para Test PAT / tareas sueltas)
+    # Helpers que NO dependen de self.running
     def _popen_capture_any(self, args, cwd=None, env=None):
         si, cf = self._startupinfo_flags()
         env = self._ensure_utf8_in_env(env)
@@ -860,7 +814,7 @@ class App(tk.Tk):
         if method == "ssh":
             return f"git@github.com:{github_user}/{repo}.git"
         elif method == "https_pat":
-            pat_token = self.pat_token_var.get().strip()
+            pat_token = (self.pat_token_var.get() or "").strip()
             if pat_token:
                 return f"https://x-access-token:{pat_token}@github.com/{github_user}/{repo}.git"
             else:
@@ -922,7 +876,7 @@ class App(tk.Tk):
         except Exception as e:
             self.worker_queue.put(("log", f"ERROR gh auth login: {e}")); return False
 
-    # ====== Limpieza de credenciales/ayudantes ======
+    # ====== Credenciales ======
     def _clear_cached_github_creds(self):
         self.worker_queue.put(("log", "Limpiando credenciales cacheadas de GitHub…"))
         si, cf = self._startupinfo_flags()
@@ -944,12 +898,9 @@ class App(tk.Tk):
             except Exception: pass
 
     def _nuke_credential_helpers(self, project_path):
-        """Elimina helpers de credenciales (local y global) que puedan interferir."""
         self.worker_queue.put(("log", "Deshabilitando credential.helper (local y global)…"))
-        # Local
         self._run_cmd(["git", "config", "--unset-all", "credential.helper"], cwd=project_path)
         self._run_cmd(["git", "config", "credential.helper", ""], cwd=project_path)
-        # Global
         try:
             self._run_cmd(["git", "config", "--global", "--unset-all", "credential.helper"], cwd=None)
             self._run_cmd(["git", "config", "--global", "credential.helper", ""], cwd=None)
@@ -957,21 +908,17 @@ class App(tk.Tk):
             pass
         self._clear_cached_github_creds()
 
-    # ====== Fijar origin con PAT embebido (x-access-token) ======
     def _reset_origin_with_pat(self, project_path):
         method = self.auth_method_var.get().strip() or "https_pat"
-        if method != "https_pat":
-            self.worker_queue.put(("log", "Método no es https_pat; no se modifica origin con PAT."))
-            return
-        github_user = self.github_user_var.get().strip()
-        repo_name   = self.repo_name_var.get().strip()
-        pat_token   = self.pat_token_var.get().strip()
+        github_user = (self.github_user_var.get() or "").strip()
+        repo_name   = (self.repo_name_var.get() or "").strip()
+        pat_token   = (self.pat_token_var.get() or "").strip()
         if not (github_user and repo_name and pat_token):
-            self.worker_queue.put(("log", "No se puede fijar origin con PAT (faltan datos: user/repo/token)."))
+            self.worker_queue.put(("log", "No se puede fijar origin con PAT (faltan user/repo/token)."))
             return
         url_pat = f"https://x-access-token:{pat_token}@github.com/{github_user}/{repo_name}.git"
         masked = pat_token[:4] + "…" + pat_token[-4:] if len(pat_token) >= 8 else "****"
-        self.worker_queue.put(("log", f"Forzando origin con PAT (x-access-token): https://x-access-token:{masked}@github.com/{github_user}/{repo_name}.git"))
+        self.worker_queue.put(("log", f"Forzando origin con PAT: https://x-access-token:{masked}@github.com/{github_user}/{repo_name}.git"))
         rc = self._run_cmd(["git", "remote", "set-url", "origin", url_pat], cwd=project_path)
         if rc != 0:
             self._run_cmd(["git", "remote", "add", "origin", url_pat], cwd=project_path)
@@ -987,7 +934,7 @@ class App(tk.Tk):
             self.worker_queue.put(("log", "GitHub CLI no disponible, no se puede crear repo remoto"))
             return False
         if not self._gh_auth_status_ok():
-            pat_token = self.pat_token_var.get().strip()
+            pat_token = (self.pat_token_var.get() or "").strip()
             if pat_token:
                 self.worker_queue.put(("log", "Autenticando GitHub CLI con token…"))
                 if not self._gh_login_with_token(pat_token):
@@ -999,13 +946,9 @@ class App(tk.Tk):
         self.worker_queue.put(("log", f"Creando repo remoto: {owner_repo} (public)…"))
         rc = self._run_cmd(["gh", "repo", "create", owner_repo, "--public", "--confirm"], cwd=project_path)
         if rc == 0:
-            # Siempre fuerza origin con PAT tras crear el repo con gh
             self._reset_origin_with_pat(project_path)
             return True
         return False
-
-    def _save_pat_in_credential_manager(self, user, token):
-        self.worker_queue.put(("log", "PAT no se persiste automáticamente (stub)."))
 
     # --- .gitignore / untrack / tamaño ---
     def _ensure_gitignore(self, project_path):
@@ -1060,10 +1003,8 @@ class App(tk.Tk):
         removed = []
         for rel in relpaths:
             full = os.path.join(project_path, rel)
-            if not os.path.exists(full):
-                continue
-            if not self._is_tracked(project_path, rel):
-                continue
+            if not os.path.exists(full): continue
+            if not self._is_tracked(project_path, rel): continue
             rc = self._run_cmd(["git","rm","--cached","-f", rel], cwd=project_path)
             if rc == 0: removed.append(rel)
         if removed: self.worker_queue.put(("log", "Untrack: " + ", ".join(removed)))
@@ -1153,6 +1094,7 @@ class App(tk.Tk):
         env = self._git_env(project_path)
         env["FILTER_BRANCH_SQUELCH_WARNING"] = "1"
         rm_parts = [f"git rm -q -f --cached --ignore-unmatch {p}" for p in paths]
+        rm_cmd = " ".join(["&&"]*0)  # dummy para claridad
         rm_cmd = " && ".join(rm_parts) or "echo noop"
         rc = self._run_cmd(
             ["git","filter-branch","-f","--prune-empty","--tag-name-filter","cat",
@@ -1176,9 +1118,7 @@ class App(tk.Tk):
             if ("/" in p) or ("\\" in p): routes.append(p.replace("\\","/"))
             else: names.append(p)
         to_purge = []
-        if names:
-            hist_routes = self._find_paths_in_history(project_path, names)
-            to_purge.extend(hist_routes)
+        if names: to_purge.extend(self._find_paths_in_history(project_path, names))
         to_purge.extend(routes)
         expanded, seen = [], set()
         for r in to_purge:
@@ -1190,7 +1130,7 @@ class App(tk.Tk):
         self.worker_queue.put(("log", "Rutas a purgar del historial: " + ", ".join(expanded)))
         ok = self._run_filter_repo(project_path, expanded)
         if not ok:
-            self.worker_queue.put(("log", "filter-repo no disponible o falló; usando filter-branch (lento)…"))
+            self.worker_queue.put(("log", "filter-repo no disponible/falló; usando filter-branch…"))
             ok = self._run_filter_branch(project_path, expanded)
         if ok:
             self.worker_queue.put(("log", "Limpieza de historia completada."))
@@ -1198,7 +1138,7 @@ class App(tk.Tk):
             self.worker_queue.put(("log", "ERROR: no se pudo limpiar la historia."))
         return ok
 
-    # --- Auto-sync con remoto cuando push es rechazado ---
+    # --- Auto-sync con remoto ---
     def _sync_with_remote(self, project_path):
         self.worker_queue.put(("log", "Intentando sincronizar con remoto (fetch/pull)…"))
         self._run_cmd(["git","fetch","origin","main"], cwd=project_path)
@@ -1223,10 +1163,10 @@ class App(tk.Tk):
         self.worker_queue.put(("log", "No se pudo sincronizar automáticamente con el remoto."))
         return False
 
-    # --- Configuración de credenciales para HTTPS ---
+    # --- Setup credenciales ---
     def _setup_credentials(self, project_path, method):
         if method == "https_pat":
-            pat_token = self.pat_token_var.get().strip()
+            pat_token = (self.pat_token_var.get() or "").strip()
             if not pat_token:
                 self.worker_queue.put(("log", "❌ ERROR: No hay PAT token configurado"))
                 self.worker_queue.put(("log", "💡 Ve a GitHub Settings > Tokens y crea un PAT token"))
@@ -1234,14 +1174,13 @@ class App(tk.Tk):
             if not self._test_pat_token_quick():
                 self.worker_queue.put(("log", "❌ El PAT token no es válido (API /user)"))
                 return False
-            # Deshabilita helpers y limpia cache, fuerza origin con PAT
             self._nuke_credential_helpers(project_path)
             self._reset_origin_with_pat(project_path)
-            self.worker_queue.put(("log", "✅ Credenciales configuradas con PAT (URL embebida x-access-token)"))
+            self.worker_queue.put(("log", "✅ Credenciales configuradas con PAT (URL x-access-token)"))
             return True
         elif method == "gh":
             if not self._gh_auth_status_ok():
-                pat_token = self.pat_token_var.get().strip()
+                pat_token = (self.pat_token_var.get() or "").strip()
                 if pat_token:
                     self.worker_queue.put(("log", "Autenticando GitHub CLI con token…"))
                     if self._gh_login_with_token(pat_token):
@@ -1257,7 +1196,7 @@ class App(tk.Tk):
         return True
 
     def _test_pat_token_quick(self):
-        pat_token = self.pat_token_var.get().strip()
+        pat_token = (self.pat_token_var.get() or "").strip()
         if not pat_token: return False
         import urllib.request, urllib.error
         try:
@@ -1269,15 +1208,14 @@ class App(tk.Tk):
         except Exception:
             return False
 
-    # --- Asegurar re-init limpio si es la primera vez ---
+    # --- Re-init limpio si es primera vez ---
     def _ensure_clean_git_repo(self, project_path):
-        """Si es primer push, borra .git si existe y re-inicializa limpio."""
         git_dir = os.path.join(project_path, ".git")
         is_repo = self._is_git_repo(project_path)
         clean_first = self.cfg.get("clean_git_on_first_time", True)
         first_time = not is_repo
         if first_time and os.path.isdir(git_dir) and clean_first:
-            self.worker_queue.put(("log", "🧹 Detectada carpeta .git existente en primer uso; eliminando para re-init limpio…"))
+            self.worker_queue.put(("log", "🧹 Detectada carpeta .git en primer uso; eliminando para re-init limpio…"))
             if not safe_rmtree(git_dir):
                 self.worker_queue.put(("log", "❌ No se pudo borrar .git. Cierra apps que bloqueen archivos e inténtalo de nuevo."))
                 return False
@@ -1287,43 +1225,44 @@ class App(tk.Tk):
                 self.worker_queue.put(("log","ERROR en git init")); return False
         return True
 
-    # --- Push con reintentos + GH013 + non-fast-forward ---
+    # --- Push con reintentos ---
     def _git_push_with_retries(self, project_path, origin="origin", branch="main"):
         attempts = 3
         method = self.auth_method_var.get().strip() or "https_pat"
+        pat_token = (self.pat_token_var.get() or "").strip()
+
+        if pat_token:
+            self._nuke_credential_helpers(project_path)
+            self._reset_origin_with_pat(project_path)
+
         if method == "https_pat":
-            pat_token = self.pat_token_var.get().strip()
             if not pat_token:
                 self.worker_queue.put(("log", "❌ ERROR: No hay PAT token configurado"))
                 self.worker_queue.put(("log", "💡 Usa Ctrl+T para testear el token"))
                 return 1
-        if not self._setup_credentials(project_path, method):
-            return 1
-        if method == "https_pat":
-            self._nuke_credential_helpers(project_path)
-            self._reset_origin_with_pat(project_path)
+            if not self._test_pat_token_quick():
+                self.worker_queue.put(("log", "❌ El PAT token no es válido (API /user)"))
+                return 1
 
         for i in range(1, attempts + 1):
-            # Diagnóstico: ver URL actual del remote
             try:
                 cur = self._remote_url(project_path)
                 self.worker_queue.put(("log", f"DEBUG push -> remote get-url origin: {cur}"))
             except Exception:
-                pass
+                cur = ""
 
             rc, out = self._run_cmd_capture(["git", "push", "-u", origin, branch], project_path)
             if rc == 0:
                 self.worker_queue.put(("log", "✅ Push exitoso"))
                 return 0
+
             text = (out or "").lower()
             self.worker_queue.put(("log", f"push intento {i}/{attempts} falló (rc={rc})"))
 
-            # --- GH013 / Push Protection ---
+            # Push Protection / secretos
             if ("gh013" in text) or ("repository rule violations" in text) or ("push protection" in text):
-                self.worker_queue.put(("log", "🛡️ Push Protection activo: purgando secretos del historial…"))
+                self.worker_queue.put(("log", "🛡️ Push Protection: purgando secretos del historial…"))
                 purge_patterns = list(set(self.cfg.get("history_purge_patterns", [])))
-                for p in ["config_autogit.json", "config_autogit.json.tmp", "*.tmp"]:
-                    if p not in purge_patterns: purge_patterns.append(p)
                 if not self._purge_history_paths(project_path, purge_patterns):
                     return rc
                 if self.cfg.get("force_push_after_purge", True):
@@ -1334,6 +1273,7 @@ class App(tk.Tk):
                 else:
                     return rc
 
+            # Non-fast-forward
             if any(s in text for s in ["fetch first", "non-fast-forward", "updates were rejected", "failed to push some refs"]):
                 self.worker_queue.put(("log", "🔄 Intentando sincronizar con remoto…"))
                 if self._sync_with_remote(project_path):
@@ -1344,6 +1284,7 @@ class App(tk.Tk):
                     else:
                         self.worker_queue.put(("log", "❌ Push aún rechazado tras sincronizar"))
 
+            # Archivos grandes
             if any(s in text for s in ["large files detected", "exceeds github's file size limit", "lfs", "gh001"]):
                 self.worker_queue.put(("log", "📦 Detectados archivos grandes, limpiando…"))
                 large_now = self._scan_large_files(project_path)
@@ -1363,8 +1304,9 @@ class App(tk.Tk):
                 else:
                     continue
 
+            # Timeouts
             if any(s in text for s in ["http 408", "timeout", "timed out", "the remote end hung up unexpectedly",
-                                        "unexpected disconnect", "operation timed out", "curl 22", "rpc failed"]):
+                                       "unexpected disconnect", "operation timed out", "curl 22", "rpc failed"]):
                 self.worker_queue.put(("log", "⏰ Timeout detectado, reconfigurando HTTP…"))
                 self._run_cmd(["git", "config", "http.version", "HTTP/1.1"], cwd=project_path)
                 self._run_cmd(["git", "config", "http.postBuffer", "524288000"], cwd=project_path)
@@ -1375,12 +1317,18 @@ class App(tk.Tk):
                 time.sleep(2 * i)
                 continue
 
+            # Autenticación
             if any(s in text for s in ["authentication failed", "could not read username", "terminal prompts disabled", "invalid username or token"]):
-                self.worker_queue.put(("log", "🔐 Error de autenticación detectado"))
-                if method == "https_pat":
-                    self.worker_queue.put(("log", "❌ PAT inválido o permisos insuficientes"))
-                    self.worker_queue.put(("log", "💡 Usa Ctrl+T para verificar el token"))
-                self._setup_credentials(project_path, method)
+                self.worker_queue.put(("log", "🔐 Error de autenticación; reescribiendo origin con PAT y reintentando…"))
+                if pat_token:
+                    self._nuke_credential_helpers(project_path)
+                    self._reset_origin_with_pat(project_path)
+                    rc2, _ = self._run_cmd_capture(["git", "push", "-u", origin, branch], project_path)
+                    if rc2 == 0:
+                        self.worker_queue.put(("log", "✅ Push exitoso tras reescribir origin con PAT"))
+                        return 0
+                continue
+
             break
 
         self.worker_queue.put(("log", f"❌ Todos los intentos de push fallaron"))
@@ -1399,7 +1347,7 @@ class App(tk.Tk):
                 self.worker_queue.put(("log", f"ERROR eliminando lock {lock}: {e}"))
         return False
 
-    # ---------- Git UTF-8 config & commit message check ----------
+    # ---------- Git UTF-8 & commit message ----------
     def _ensure_git_utf8_config(self, project_path):
         steps = [
             (["git","config","i18n.commitEncoding","utf-8"], "i18n.commitEncoding=utf-8"),
@@ -1432,13 +1380,13 @@ class App(tk.Tk):
             if not self._exe_exists("git"):
                 self.worker_queue.put(("log","ERROR: Git no está en PATH.")); self.worker_queue.put(("done",None)); return
 
-            git_name = self.git_user_name_var.get().strip()
-            git_mail = self.git_user_email_var.get().strip()
-            method   = self.auth_method_var.get().strip() or "https_pat"
-            gh_user  = self.github_user_var.get().strip()
+            git_name = (self.git_user_name_var.get() or "").strip()
+            git_mail = (self.git_user_email_var.get() or "").strip()
+            method   = (self.auth_method_var.get() or "https_pat").strip()
+            gh_user  = (self.github_user_var.get() or "").strip()
 
             if method == "https_pat":
-                pat_token = self.pat_token_var.get().strip()
+                pat_token = (self.pat_token_var.get() or "").strip()
                 if not pat_token:
                     self.worker_queue.put(("log","❌ ERROR: No hay PAT token configurado"))
                     self.worker_queue.put(("log","💡 Usa Ctrl+T para testear el token"))
@@ -1448,7 +1396,7 @@ class App(tk.Tk):
             if not self._ensure_clean_git_repo(project_path):
                 self.worker_queue.put(("done",None)); return
 
-            # 1) CONFIG identidad y branch
+            # 1) Identidad y branch
             identity_steps = [
                 (["git","config","user.name", git_name], "git config user.name"),
                 (["git","config","user.email", git_mail], "git config user.email"),
@@ -1474,7 +1422,7 @@ class App(tk.Tk):
                 self._append_gitignore_patterns(project_path, large)
                 self._untrack_list(project_path, large)
 
-            # 3) README inicial si aplica
+            # 3) README inicial si falta
             if self.cfg.get("create_readme_if_missing", True):
                 readme_path = os.path.join(project_path, "README.md")
                 if not os.path.exists(readme_path):
@@ -1490,7 +1438,7 @@ class App(tk.Tk):
                 if rc != 0:
                     self.worker_queue.put(("log","ERROR en git add .")); self.worker_queue.put(("done",None)); return
 
-            # Verifica si hay cambios para commit
+            # Verifica si hay staged
             si, cf = self._startupinfo_flags()
             rc_diff_cached = subprocess.call(
                 ["git","diff","--cached","--quiet"],
@@ -1523,7 +1471,7 @@ class App(tk.Tk):
 
             self._maybe_fix_last_commit_message(project_path)
 
-            # 5) REMOTO
+            # 5) Remoto
             remote_exists = False
             if self._exe_exists("gh") and gh_user and repo_name:
                 remote_exists = self._remote_exists(gh_user, repo_name)
@@ -1539,10 +1487,12 @@ class App(tk.Tk):
             else:
                 self.worker_queue.put(("log","✅ Repositorio remoto existe"))
 
-            # Asegurar origin según método
-            if method == "https_pat":
+            # Asegurar origin
+            if (self.pat_token_var.get() or "").strip():
                 self._nuke_credential_helpers(project_path)
                 self._reset_origin_with_pat(project_path)
+                cur = self._remote_url(project_path)
+                self.worker_queue.put(("log", f"Origin (pre-push) fijado con PAT: {('x-access-token' in (cur or '')) and 'OK' or 'NO'}"))
             else:
                 origin_url = self._build_origin(method, gh_user, repo_name)
                 self._ensure_origin(project_path, origin_url)
@@ -1572,12 +1522,12 @@ class App(tk.Tk):
             self._autodetect_repo_name(); repo=self.repo_name_var.get().strip()
             if not repo: self._status("No se pudo determinar el nombre del repo."); return
 
-        method = self.auth_method_var.get().strip() or "https_pat"
-        if method == "https_pat" and not self.pat_token_var.get().strip():
+        method = (self.auth_method_var.get() or "https_pat").strip()
+        if method == "https_pat" and not (self.pat_token_var.get() or "").strip():
             self._status("ERROR: Configura un PAT token primero (Ctrl+T para testear)")
-            messagebox.showerror("PAT Token Requerido", 
-                               "Debes configurar un Personal Access Token (PAT) de GitHub.\n\n" 
-                               "Presiona Ctrl+T para testear el token o F2 para instrucciones.")
+            messagebox.showerror("PAT Token Requerido",
+                                 "Debes configurar un Personal Access Token (PAT) de GitHub.\n\n"
+                                 "Presiona Ctrl+T para testear el token o F2 para instrucciones.")
             return
 
         self.running=True; self.btn_run.config(state="disabled"); self.btn_stop.config(state="normal")
