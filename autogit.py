@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Git Helper GUI – v0.2.7
-- ADD: Limpieza segura de .git antes del primer push si existe (reinit limpio)
+Git Helper GUI – v0.3.0
+- ADD: Limpieza segura de .git si es primer uso (re-init limpio)
 - ADD: safe_rmtree() con reintentos/backoff (Windows/OneDrive)
-- ADD: safe_write_json() robusto con reintentos/backoff
-- CHANGE: Siempre forzar origin con PAT (https_pat), limpiar credenciales cacheadas y desactivar helpers
-- CHANGE: Test PAT (ls-remote) usa repo real con URL con PAT
+- ADD: safe_write_json() y safe_read_json() robustos
+- CHANGE: Forzar origin con formato x-access-token (recomendado por GitHub)
+- ADD: _nuke_credential_helpers() para eliminar helpers locales/globales y cache
+- CHANGE: Test PAT usa repo real y URL con PAT
 """
 
 import os, sys, json, hashlib, threading, datetime, queue, traceback, subprocess, time
@@ -75,15 +76,15 @@ def safe_write_json(path, data, retries=10, base_delay=0.05):
         log_line(f"⚠️ No se pudo reemplazar {path}. Guardado en {home_fallback}. Último error: {last_err}")
     except Exception as e:
         log_line(f"❌ FALLO guardando config. Último error: {last_err}. Fallback error: {e}")
+
 def safe_read_json(path, default):
-    """Lee JSON de forma segura. Si no existe o falla, devuelve default."""
+    """Lee JSON de forma segura. Si no existe o falla, devuelve default (mergeando claves)."""
     try:
         if not os.path.exists(path):
             return default
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
             if isinstance(data, dict):
-                # Mezcla defaults con lo guardado
                 merged = default.copy()
                 merged.update(data)
                 return merged
@@ -185,7 +186,7 @@ DEFAULT_CONFIG = {
     "history_purge_patterns": ["autogit.exe", "autogit*.exe"],
     "force_push_after_purge": True,
 
-    # NUEVO: Forzar re-init limpio si es la primera vez
+    # Forzar re-init limpio si es primera vez
     "clean_git_on_first_time": True
 }
 
@@ -558,7 +559,7 @@ class App(tk.Tk):
                 headers = {'Authorization': f'token {pat_token}','User-Agent': 'AutoGit-App','Accept': 'application/vnd.github.v3+json'}
                 req = urllib.request.Request(url, headers=headers)
                 with urllib.request.urlopen(req, timeout=10) as response:
-                    data = json_lib.loads(response.read().decode())
+                    data = json.loads(response.read().decode())
                     callback(f"   ✅ Accesible: {data.get('html_url', 'N/A')}")
             except urllib.error.HTTPError as e:
                 if e.code == 404:
@@ -575,9 +576,11 @@ class App(tk.Tk):
             self._popen_run_any(["git", "config", "user.email", "test@example.com"], cwd=test_dir)
             if not os.path.exists(os.path.join(test_dir, ".git")):
                 self._popen_run_any(["git", "init"], cwd=test_dir)
-            remote_url = f"https://{github_user}:{pat_token}@github.com/{github_user}/{repo_name}.git"
+
+            remote_url = f"https://x-access-token:{pat_token}@github.com/{github_user}/{repo_name}.git"
             self._popen_run_any(["git", "remote", "remove", "origin"], cwd=test_dir)
             self._popen_run_any(["git", "remote", "add", "origin", remote_url], cwd=test_dir)
+
             rc, out = self._popen_capture_any(["git", "ls-remote", "origin"], cwd=test_dir)
             if rc == 0:
                 callback("   ✅ Git authentication OK (ls-remote)")
@@ -848,7 +851,7 @@ class App(tk.Tk):
         elif method == "https_pat":
             pat_token = self.pat_token_var.get().strip()
             if pat_token:
-                return f"https://{github_user}:{pat_token}@github.com/{github_user}/{repo}.git"
+                return f"https://x-access-token:{pat_token}@github.com/{github_user}/{repo}.git"
             else:
                 return f"https://github.com/{github_user}/{repo}.git"
         else:  # gh
@@ -908,7 +911,7 @@ class App(tk.Tk):
         except Exception as e:
             self.worker_queue.put(("log", f"ERROR gh auth login: {e}")); return False
 
-    # ====== NUEVO: limpiar credenciales cacheadas ======
+    # ====== Limpieza de credenciales/ayudantes ======
     def _clear_cached_github_creds(self):
         self.worker_queue.put(("log", "Limpiando credenciales cacheadas de GitHub…"))
         si, cf = self._startupinfo_flags()
@@ -929,7 +932,21 @@ class App(tk.Tk):
                 p.communicate(input="protocol=https\nhost=github.com\n\n", timeout=10)
             except Exception: pass
 
-    # ====== NUEVO: fijar origin con PAT embebido ======
+    def _nuke_credential_helpers(self, project_path):
+        """Elimina helpers de credenciales (local y global) que puedan interferir."""
+        self.worker_queue.put(("log", "Deshabilitando credential.helper (local y global)…"))
+        # Local
+        self._run_cmd(["git", "config", "--unset-all", "credential.helper"], cwd=project_path)
+        self._run_cmd(["git", "config", "credential.helper", ""], cwd=project_path)
+        # Global
+        try:
+            self._run_cmd(["git", "config", "--global", "--unset-all", "credential.helper"], cwd=None)
+            self._run_cmd(["git", "config", "--global", "credential.helper", ""], cwd=None)
+        except Exception:
+            pass
+        self._clear_cached_github_creds()
+
+    # ====== Fijar origin con PAT embebido (x-access-token) ======
     def _reset_origin_with_pat(self, project_path):
         method = self.auth_method_var.get().strip() or "https_pat"
         if method != "https_pat":
@@ -941,13 +958,19 @@ class App(tk.Tk):
         if not (github_user and repo_name and pat_token):
             self.worker_queue.put(("log", "No se puede fijar origin con PAT (faltan datos: user/repo/token)."))
             return
-        url_pat = f"https://{github_user}:{pat_token}@github.com/{github_user}/{repo_name}.git"
-        self.worker_queue.put(("log", f"Forzando origin (con PAT): {url_pat}"))
+        url_pat = f"https://x-access-token:{pat_token}@github.com/{github_user}/{repo_name}.git"
+        masked = pat_token[:4] + "…" + pat_token[-4:] if len(pat_token) >= 8 else "****"
+        self.worker_queue.put(("log", f"Forzando origin con PAT (x-access-token): https://x-access-token:{masked}@github.com/{github_user}/{repo_name}.git"))
         rc = self._run_cmd(["git", "remote", "set-url", "origin", url_pat], cwd=project_path)
         if rc != 0:
             self._run_cmd(["git", "remote", "add", "origin", url_pat], cwd=project_path)
+        try:
+            current = self._remote_url(project_path)
+            self.worker_queue.put(("log", f"Remote actual: {current}"))
+        except Exception:
+            pass
 
-    # ====== CAMBIO: crear remoto sin dejar origin “limpio” si usas PAT ======
+    # ====== Crear repo remoto ======
     def _create_remote(self, owner_repo, project_path):
         if not self._exe_exists("gh"):
             self.worker_queue.put(("log", "GitHub CLI no disponible, no se puede crear repo remoto"))
@@ -964,14 +987,11 @@ class App(tk.Tk):
                 return False
         self.worker_queue.put(("log", f"Creando repo remoto: {owner_repo} (public)…"))
         rc = self._run_cmd(["gh", "repo", "create", owner_repo, "--public", "--confirm"], cwd=project_path)
-        if rc != 0:
-            return False
-        # Con https_pat, luego forzaremos origin con PAT explícito
-        method = self.auth_method_var.get().strip() or "https_pat"
-        user, repo = owner_repo.split("/", 1)
-        if method != "https_pat":
-            self._ensure_origin(project_path, self._build_origin("gh", user, repo))
-        return True
+        if rc == 0:
+            # Siempre fuerza origin con PAT tras crear el repo con gh
+            self._reset_origin_with_pat(project_path)
+            return True
+        return False
 
     def _save_pat_in_credential_manager(self, user, token):
         self.worker_queue.put(("log", "PAT no se persiste automáticamente (stub)."))
@@ -1203,12 +1223,10 @@ class App(tk.Tk):
             if not self._test_pat_token_quick():
                 self.worker_queue.put(("log", "❌ El PAT token no es válido (API /user)"))
                 return False
-            # Limpia credenciales cacheadas, fuerza origin con PAT y desactiva helpers
-            self._clear_cached_github_creds()
+            # Deshabilita helpers y limpia cache, fuerza origin con PAT
+            self._nuke_credential_helpers(project_path)
             self._reset_origin_with_pat(project_path)
-            self._run_cmd(["git", "config", "--unset-all", "credential.helper"], cwd=project_path)
-            self._run_cmd(["git", "config", "credential.helper", ""], cwd=project_path)
-            self.worker_queue.put(("log", "✅ Credenciales configuradas con PAT (URL embebida)"))
+            self.worker_queue.put(("log", "✅ Credenciales configuradas con PAT (URL embebida x-access-token)"))
             return True
         elif method == "gh":
             if not self._gh_auth_status_ok():
@@ -1240,18 +1258,17 @@ class App(tk.Tk):
         except Exception:
             return False
 
-    # --- NUEVO: Asegurar re-init limpio si es la primera vez ---
+    # --- Asegurar re-init limpio si es la primera vez ---
     def _ensure_clean_git_repo(self, project_path):
         """Si es primer push, borra .git si existe y re-inicializa limpio."""
         git_dir = os.path.join(project_path, ".git")
         is_repo = self._is_git_repo(project_path)
         clean_first = self.cfg.get("clean_git_on_first_time", True)
-        # first_time = no repo válido
         first_time = not is_repo
         if first_time and os.path.isdir(git_dir) and clean_first:
             self.worker_queue.put(("log", "🧹 Detectada carpeta .git existente en primer uso; eliminando para re-init limpio…"))
             if not safe_rmtree(git_dir):
-                self.worker_queue.put(("log", "❌ No se pudo borrar .git. Cancela o cierra apps que bloqueen archivos."))
+                self.worker_queue.put(("log", "❌ No se pudo borrar .git. Cierra apps que bloqueen archivos e inténtalo de nuevo."))
                 return False
         if first_time:
             self.worker_queue.put(("log","🆕 Inicializando repositorio Git (clean)…"))
@@ -1272,10 +1289,17 @@ class App(tk.Tk):
         if not self._setup_credentials(project_path, method):
             return 1
         if method == "https_pat":
-            self._clear_cached_github_creds()
+            self._nuke_credential_helpers(project_path)
             self._reset_origin_with_pat(project_path)
 
         for i in range(1, attempts + 1):
+            # Diagnóstico: ver URL actual del remote
+            try:
+                cur = self._remote_url(project_path)
+                self.worker_queue.put(("log", f"DEBUG push -> remote get-url origin: {cur}"))
+            except Exception:
+                pass
+
             rc, out = self._run_cmd_capture(["git", "push", "-u", origin, branch], project_path)
             if rc == 0:
                 self.worker_queue.put(("log", "✅ Push exitoso"))
@@ -1490,6 +1514,7 @@ class App(tk.Tk):
 
             # Asegurar origin según método
             if method == "https_pat":
+                self._nuke_credential_helpers(project_path)
                 self._reset_origin_with_pat(project_path)
             else:
                 origin_url = self._build_origin(method, gh_user, repo_name)
