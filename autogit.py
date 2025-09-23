@@ -1175,7 +1175,8 @@ class App(tk.Tk):
                 elif kind=="done":
                     self.running=False; self.btn_run.config(state="normal"); self.btn_stop.config(state="disabled")
                     # Si quieres reactivar autocierre al terminar, descomenta:
-                    # if self.autoclose_var.get(): self._schedule_autoclose()
+                    if self.autoclose_var.get():
+                        self._schedule_autoclose()
         except queue.Empty:
             pass
         self.after(120, self._poll_worker_queue)
