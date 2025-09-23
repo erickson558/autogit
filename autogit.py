@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Git Helper GUI – v0.3.1
-- FIX: Comilla extra en menú "Instrucciones PAT" (SyntaxError)
-- ADD: Limpieza segura de .git si es primer uso (re-init limpio)
-- ADD: safe_rmtree() con reintentos/backoff (Windows/OneDrive)
-- ADD: safe_write_json() y safe_read_json() robustos
-- CHANGE: Forzar origin con formato x-access-token (recomendado por GitHub)
-- ADD: _nuke_credential_helpers() para eliminar helpers locales/globales y cache
-- CHANGE: Test PAT usa repo real y URL con PAT
+Git Helper GUI – v0.3.2
+- FIX: .gitignore ampliado (config_autogit.json*, *.tmp, .cfg_*.tmp)
+- FIX: safe_write_json usa temporales ocultos y patrón ignorado por Git
+- ADD: Purga automática al detectar GH013 (Push Protection) + force-push
+- ADD: Re-init limpio en primer uso (opcional) borrando .git existente
+- ADD: Forzar remote origin con x-access-token:<PAT> (https_pat)
+- ADD: Nuke de credential helpers (local y global) + limpieza cache
+- FIX: Test PAT usa json_lib de forma consistente
 """
 
 import os, sys, json, hashlib, threading, datetime, queue, traceback, subprocess, time
@@ -38,13 +38,14 @@ def log_line(msg):
         pass
 
 def safe_write_json(path, data, retries=10, base_delay=0.05):
-    """Escribe JSON de forma robusta (locks OneDrive)."""
+    """Escribe JSON de forma robusta (locks OneDrive) y evita que el .tmp se rastree por Git."""
     try:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     except Exception:
         pass
     last_err = None
     for attempt in range(retries):
+        # Temporal oculto y con patrón que ignoramos en .gitignore
         tmp_name = f".cfg_{os.getpid()}_{int(time.time()*1000)}_{random.randint(1000,9999)}.tmp"
         tmp_path = os.path.join(os.path.dirname(path) or ".", tmp_name)
         try:
@@ -52,7 +53,7 @@ def safe_write_json(path, data, retries=10, base_delay=0.05):
                 json.dump(data, f, ensure_ascii=False, indent=2)
                 f.flush(); os.fsync(f.fileno())
             try:
-                os.replace(tmp_path, path)
+                os.replace(tmp_path, path)  # atómico en mismo volumen
             except PermissionError:
                 shutil.move(tmp_path, path)
             return
@@ -69,7 +70,7 @@ def safe_write_json(path, data, retries=10, base_delay=0.05):
             except Exception: pass
             log_line(f"ERROR escribiendo JSON: {e}")
             break
-    # Fallback final
+    # Fallback final fuera del repo (por si hay locks fuertes)
     try:
         home_fallback = os.path.join(os.path.expanduser("~"), "config_autogit.local.json")
         with open(home_fallback, "w", encoding="utf-8") as f:
@@ -184,7 +185,13 @@ DEFAULT_CONFIG = {
 
     # Grandes / limpieza historia
     "max_file_size_mb": 95,
-    "history_purge_patterns": ["autogit.exe", "autogit*.exe"],
+    "history_purge_patterns": [
+        "autogit.exe",
+        "autogit*.exe",
+        "config_autogit.json",
+        "config_autogit.json.tmp",
+        "*.tmp"
+    ],
     "force_push_after_purge": True,
 
     # Forzar re-init limpio si es primera vez
@@ -197,6 +204,7 @@ GITIGNORE_LINES = [
     "config.json",
     "log.txt",
     "config_autogit.json",
+    "config_autogit.json*",
     "log_autogit.txt",
     "*.exe",
     "*.pyc",
@@ -206,6 +214,8 @@ GITIGNORE_LINES = [
     "node_modules/",
     ".DS_Store",
     "Thumbs.db",
+    "*.tmp",
+    ".cfg_*.tmp",
 ]
 
 class AboutDialog(tk.Toplevel):
@@ -280,8 +290,7 @@ class App(tk.Tk):
         st.configure("Status.TLabel", background="#0A0E12", foreground="#9FB4C7", font=("Segoe UI", 9))
 
     def _build_menu(self):
-        menubar = tk.Menu(self, tearoff=0)
-        self.config(menu=menubar)
+        menubar = tk.Menu(self, tearoff=0); self.config(menu=menubar)
 
         m_app = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Aplicación", menu=m_app, underline=0)
@@ -294,7 +303,6 @@ class App(tk.Tk):
         m_help = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Ayuda", menu=m_help, underline=0)
         m_help.add_command(label="About", accelerator="F1", command=self._show_about)
-        # <-- FIX aquí: sin comilla extra al final -->
         m_help.add_command(label="Instrucciones PAT", accelerator="F2", command=self._show_pat_instructions)
 
     def _build_widgets(self):
@@ -562,7 +570,7 @@ class App(tk.Tk):
                 headers = {'Authorization': f'token {pat_token}','User-Agent': 'AutoGit-App','Accept': 'application/vnd.github.v3+json'}
                 req = urllib.request.Request(url, headers=headers)
                 with urllib.request.urlopen(req, timeout=10) as response:
-                    data = json.loads(response.read().decode())
+                    data = json_lib.loads(response.read().decode())
                     callback(f"   ✅ Accesible: {data.get('html_url', 'N/A')}")
             except urllib.error.HTTPError as e:
                 if e.code == 404:
@@ -1279,7 +1287,7 @@ class App(tk.Tk):
                 self.worker_queue.put(("log","ERROR en git init")); return False
         return True
 
-    # --- Push con reintentos + GH001 + non-fast-forward ---
+    # --- Push con reintentos + GH013 + non-fast-forward ---
     def _git_push_with_retries(self, project_path, origin="origin", branch="main"):
         attempts = 3
         method = self.auth_method_var.get().strip() or "https_pat"
@@ -1309,6 +1317,22 @@ class App(tk.Tk):
                 return 0
             text = (out or "").lower()
             self.worker_queue.put(("log", f"push intento {i}/{attempts} falló (rc={rc})"))
+
+            # --- GH013 / Push Protection ---
+            if ("gh013" in text) or ("repository rule violations" in text) or ("push protection" in text):
+                self.worker_queue.put(("log", "🛡️ Push Protection activo: purgando secretos del historial…"))
+                purge_patterns = list(set(self.cfg.get("history_purge_patterns", [])))
+                for p in ["config_autogit.json", "config_autogit.json.tmp", "*.tmp"]:
+                    if p not in purge_patterns: purge_patterns.append(p)
+                if not self._purge_history_paths(project_path, purge_patterns):
+                    return rc
+                if self.cfg.get("force_push_after_purge", True):
+                    self._run_cmd(["git", "push", "--force", "--prune", origin, "+refs/heads/*:refs/heads/*"], cwd=project_path)
+                    self._run_cmd(["git", "push", "--force", "--prune", origin, "+refs/tags/*:refs/tags/*"], cwd=project_path)
+                    self.worker_queue.put(("log", "✅ Push forzado exitoso después de purgar secretos"))
+                    return 0
+                else:
+                    return rc
 
             if any(s in text for s in ["fetch first", "non-fast-forward", "updates were rejected", "failed to push some refs"]):
                 self.worker_queue.put(("log", "🔄 Intentando sincronizar con remoto…"))
@@ -1551,8 +1575,8 @@ class App(tk.Tk):
         method = self.auth_method_var.get().strip() or "https_pat"
         if method == "https_pat" and not self.pat_token_var.get().strip():
             self._status("ERROR: Configura un PAT token primero (Ctrl+T para testear)")
-            messagebox.showerror("PAT Token Requerido",
-                               "Debes configurar un Personal Access Token (PAT) de GitHub.\n\n"
+            messagebox.showerror("PAT Token Requerido", 
+                               "Debes configurar un Personal Access Token (PAT) de GitHub.\n\n" 
                                "Presiona Ctrl+T para testear el token o F2 para instrucciones.")
             return
 

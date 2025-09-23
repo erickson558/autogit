@@ -12,3 +12,6 @@ Thumbs.db
 autogit.exe
 config_autogit.json
 log_autogit.txt
+config_autogit.json*
+*.tmp
+.cfg_*.tmp
