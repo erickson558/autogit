@@ -515,21 +515,24 @@ class App(tk.Tk):
         self.txt_log.configure(yscrollcommand=sb.set)
 
         # --- Status bar (grid para fijar contador a la derecha) ---
-        status = tk.Frame(self, bg="#0A0E12", bd=1, relief="sunken", height=24)
-        status.pack(side="bottom", fill="x")
-        status.pack_propagate(False)
+        # Separador fino para que se “despegue” del área de logs
+        self._status_sep = ttk.Separator(self, orient="horizontal")
+        self._status_sep.pack(side="bottom", fill="x")
+        
+        # Statusbar más alta y visible
+        self.statusbar = tk.Frame(self, bg="#0A0E12", height=32)  # 32 px (mejor en pantallas con escala)
+        self.statusbar.pack(side="bottom", fill="x")
+        self.statusbar.pack_propagate(False)
+        
+        self.status_var = tk.StringVar(value=self.cfg.get("status_text", "Listo."))
+        self.countdown_var = tk.StringVar(value=self.cfg.get("countdown_text", ""))  # por si quieres persistirlo
+        
+        self.status_label = ttk.Label(self.statusbar, textvariable=self.status_var, style="Status.TLabel")
+        self.status_label.pack(side="left", padx=10)
+        
+        self.countdown_label = ttk.Label(self.statusbar, textvariable=self.countdown_var, style="Status.TLabel")
+        self.countdown_label.pack(side="right", padx=10)
 
-        self.status_var = tk.StringVar(value=self.cfg.get("status_text","Listo."))
-        self.countdown_var = tk.StringVar(value="")
-
-        status.grid_columnconfigure(0, weight=1)
-        status.grid_columnconfigure(1, weight=0)
-
-        self.status_lbl = ttk.Label(status, textvariable=self.status_var, style="Status.TLabel")
-        self.status_lbl.grid(row=0, column=0, sticky="w", padx=10, pady=2)
-
-        self.countdown_lbl = ttk.Label(status, textvariable=self.countdown_var, style="Status.TLabel")
-        self.countdown_lbl.grid(row=0, column=1, sticky="e", padx=10, pady=2)
 
     # ---------- Shortcuts / About ----------
     def _bind_shortcuts(self):
@@ -557,9 +560,10 @@ class App(tk.Tk):
             secs = int(self.cfg.get("autoclose_seconds", 60))
         except:
             secs = 60
-        if secs < 1: secs = 1
+        if secs < 1:
+            secs = 1
         self.autoclose_remaining = secs
-        self.countdown_var.set(f"Auto-cierre en: {self.autoclose_remaining} s")
+        self.countdown_var.set(f"Cerrando en {self.autoclose_remaining}s")
         self._title_set_countdown(self.autoclose_remaining)
         self.countdown_job = self.after(1000, self._tick_countdown)
 
@@ -573,12 +577,15 @@ class App(tk.Tk):
 
     def _tick_countdown(self):
         if not self.autoclose_var.get():
-            self._cancel_autoclose(); return
+            self._cancel_autoclose()
+            return
         self.autoclose_remaining -= 1
         if self.autoclose_remaining <= 0:
-            self.countdown_var.set("Auto-cierre: 0 s"); self._title_set_countdown(0)
-            self.on_close(); return
-        self.countdown_var.set(f"Auto-cierre: {self.autoclose_remaining} s")
+            self.countdown_var.set("Cerrando en 0s")
+            self._title_set_countdown(0)
+            self.on_close()
+            return
+        self.countdown_var.set(f"Cerrando en {self.autoclose_remaining}s")
         self._title_set_countdown(self.autoclose_remaining)
         self.countdown_job = self.after(1000, self._tick_countdown)
 
