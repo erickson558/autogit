@@ -511,12 +511,24 @@ class App(tk.Tk):
         sb = ttk.Scrollbar(logf, orient="vertical", command=self.txt_log.yview); sb.pack(side="right", fill="y")
         self.txt_log.configure(yscrollcommand=sb.set)
 
+                # --- Status bar ---
         status = tk.Frame(self, bg="#0A0E12", bd=1, relief="sunken", height=24)
-        status.pack(side="bottom", fill="x"); status.pack_propagate(False)
+        status.pack(side="bottom", fill="x")
+        status.pack_propagate(False)
+
         self.status_var = tk.StringVar(value=self.cfg.get("status_text","Listo."))
-        ttk.Label(status, textvariable=self.status_var, style="Status.TLabel").pack(side="left", padx=10)
         self.countdown_var = tk.StringVar(value="")
-        ttk.Label(status, textvariable=self.countdown_var, style="Status.TLabel").pack(side="right", padx=10)
+
+        # Usamos grid para que el texto de la izq. ocupe el espacio y el contador quede pegado a la derecha.
+        status.grid_columnconfigure(0, weight=1)
+        status.grid_columnconfigure(1, weight=0)
+
+        self.status_lbl = ttk.Label(status, textvariable=self.status_var, style="Status.TLabel")
+        self.status_lbl.grid(row=0, column=0, sticky="w", padx=10, pady=2)
+
+        self.countdown_lbl = ttk.Label(status, textvariable=self.countdown_var, style="Status.TLabel")
+        self.countdown_lbl.grid(row=0, column=1, sticky="e", padx=10, pady=2)
+
 
     # ---------- Shortcuts / About ----------
     def _bind_shortcuts(self):
