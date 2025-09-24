@@ -204,7 +204,7 @@ class ListEditorDialog(tk.Toplevel):
         self.resizable(True, True)
         self.transient(master)
         self.grab_set()
-
+        self._build_style(); self._build_menu(); self._build_widgets()
         frm = ttk.Frame(self); frm.pack(fill="both", expand=True, padx=12, pady=12)
         self.lb = tk.Listbox(frm, height=12, bg="#0F1620", fg="#C9D1D9", selectmode="extended")
         self.lb.grid(row=0, column=0, rowspan=6, sticky="nsew")
@@ -232,6 +232,8 @@ class ListEditorDialog(tk.Toplevel):
 
         self.bind("<Escape>", lambda e: self._cancel())
         self.update_idletasks()
+        if self.cfg.get("autoclose_enabled", False) and not self.running:
+            self._schedule_autoclose()
         # Centrar sobre master
         try:
             x = master.winfo_rootx() + master.winfo_width()//2 - self.winfo_width()//2
@@ -1320,7 +1322,10 @@ class App(tk.Tk):
             self.worker_queue.put(("log", f"❌ ERROR pipeline: {e}"))
             self.worker_queue.put(("log", traceback.format_exc()))
         finally:
+    # Rearmar autocierre al terminar (éxito o error), lo decide el poll según la casilla
+            self.worker_queue.put(("arm_autoclose", None))
             self.worker_queue.put(("done", None))
+
 
     # ---------- Orquestación ----------
     def _start_pipeline(self):
@@ -1357,15 +1362,26 @@ class App(tk.Tk):
         try:
             while True:
                 kind, payload = self.worker_queue.get_nowait()
-                if kind=="log":    self._append_log(payload)
-                elif kind=="stat": self._status(payload)
-                elif kind=="done":
-                    self.running=False; self.btn_run.config(state="normal"); self.btn_stop.config(state="disabled")
+                if kind == "log":
+                    self._append_log(payload)
+                elif kind == "stat":
+                    self._status(payload)
+                elif kind == "arm_autoclose":
+                    # Rearma countdown si está habilitado y NO está corriendo nada
+                    if self.autoclose_var.get() and not self.running:
+                        self._schedule_autoclose()
+                        self._append_log("⏳ Auto-cierre rearmado al finalizar el proceso.")
+                elif kind == "done":
+                    self.running = False
+                    self.btn_run.config(state="normal")
+                    self.btn_stop.config(state="disabled")
+                    # por si el arm_autoclose se perdió en carrera:
                     if self.autoclose_var.get():
                         self._schedule_autoclose()
         except queue.Empty:
             pass
-        self._schedule_poll()
+        self.after(120, self._poll_worker_queue)
+
 
     def _schedule_poll(self):
         try:
