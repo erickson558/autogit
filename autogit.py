@@ -1,16 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-Git Helper GUI – v0.3.7
-Cambios 0.3.7:
-- Selector forzado de archivos (multi-ruta) con filtro (*.py;*.txt) y búsqueda.
-- Countdown vuelve a statusbar y al título de la ventana; también se imprime en el log.
-- Cancelación segura de after() al cerrar (poll, countdowns) para evitar "invalid command name".
-- Se mantienen selecciones y geometry.
+Git Helper GUI – v0.3.8
+Cambios 0.3.8 (fusión sobre 0.3.7):
+- Botón "Detener" ahora cancela el pipeline de verdad:
+  - Se guarda y termina el proceso Git en curso (terminate/kill) con self._current_proc + lock.
+  - Los wrappers de subprocess respetan self.running y no inician nuevos comandos si ya se pidió detener.
+- Se excluye únicamente autogit.exe del repo:
+  - .gitignore ya no tiene *.exe global; añade 'autogit.exe'.
+  - Se fuerza untrack de autogit.exe y del ejecutable en uso si está congelado.
 
-Mantiene 0.3.6:
-- Selector de subcarpetas (multi) y archivos (nativo) con persistencia.
+Mantiene 0.3.7:
+- Selector forzado de archivos (multi-ruta) con filtro (*.py;*.txt) y búsqueda.
+- Selector de subcarpetas (multi) y selector nativo de archivos con persistencia.
 - Pipeline respeta alcance (subcarpetas/archivos seleccionados) o usa git add . si no hay selección.
-- Badge con conteo "Subcarpetas: X | Archivos: Y".
+- Countdown visible en statusbar, título de ventana y también en el log.
+- Cancelación de after() (poll, countdowns) en on_close para evitar "invalid command name".
+- Persistencia de selecciones y geometry.
 """
 
 import os, sys, json, hashlib, threading, datetime, queue, traceback, subprocess, time
@@ -167,6 +172,7 @@ DEFAULT_CONFIG = {
     "clean_git_on_first_time": True
 }
 
+# Nota: antes estaba "*.exe". Lo cambiamos a "autogit.exe" para no ignorar todos los .exe.
 GITIGNORE_LINES = [
     "# --- GitHelper default ---",
     "config.json",
@@ -176,7 +182,7 @@ GITIGNORE_LINES = [
     ".cfg_*.tmp",
     "*.tmp",
     "log_autogit.txt",
-    "*.exe",
+    "autogit.exe",
     "*.pyc",
     "__pycache__/",
     ".venv/",
@@ -389,6 +395,11 @@ class App(tk.Tk):
         self.worker_thread = None
         self.worker_queue  = queue.Queue()
         self.running = False
+
+        # --- NUEVO: manejo del proceso en curso para poder detenerlo ---
+        self._current_proc = None
+        self._proc_lock = threading.Lock()
+
         self.countdown_job = None
         self.countdown_log_job = None
         self.autoclose_remaining = 0
@@ -781,7 +792,7 @@ class App(tk.Tk):
         self.txt_log.insert("end", f"[{ts}] {txt}\n"); self.txt_log.see("end")
         log_line(txt)
 
-    # ---------- Subprocess ----------
+    # ---------- Subprocess (cancelables) ----------
     def _startupinfo_flags(self):
         si = None; cf = 0
         if os.name == "nt":
@@ -789,64 +800,114 @@ class App(tk.Tk):
             try: cf = subprocess.CREATE_NO_WINDOW
             except AttributeError: cf = 0
         return si, cf
+
     def _utf8_env_overlay(self):
         return {"LC_ALL":"C.UTF-8","LANG":"C.UTF-8","LESSCHARSET":"utf-8"}
+
     def _git_env(self, project_path):
         env = os.environ.copy()
         env["GIT_PAGER"]="cat"; env["PAGER"]="cat"; env["GH_PAGER"]="cat"
         env["GIT_TERMINAL_PROMPT"]="0"; env["GIT_ASKPASS"]="echo"; env["GCM_INTERACTIVE"]="Never"; env["NO_COLOR"]="1"
         env.update(self._utf8_env_overlay()); return env
+
     def _ensure_utf8_in_env(self, env):
         if env is None: env=os.environ.copy()
         env.update(self._utf8_env_overlay()); return env
-    def _popen_capture_any(self, args, cwd=None, env=None):
-        si, cf = self._startupinfo_flags(); env=self._ensure_utf8_in_env(env)
+
+    def _launch_proc(self, args, cwd=None, env=None):
+        """Lanza un proceso y registra handler para poder cancelarlo."""
+        if not self.running:
+            return None
+        si, cf = self._startupinfo_flags()
+        env = self._ensure_utf8_in_env(env)
         try:
-            p = subprocess.Popen(args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                 text=True, encoding="utf-8", errors="replace",
-                                 startupinfo=si, creationflags=cf, env=env)
-            out,_=p.communicate(); return p.returncode, out
+            p = subprocess.Popen(
+                args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace",
+                startupinfo=si, creationflags=cf, env=env
+            )
+            with self._proc_lock:
+                self._current_proc = p
+            return p
         except FileNotFoundError:
-            return 127, f"ERROR: comando no encontrado: {args[0]}"
+            self.worker_queue.put(("log", f"ERROR: comando no encontrado: {args[0]}"))
+            return None
         except Exception as e:
+            self.worker_queue.put(("log", f"ERROR ejecutando {args}: {e}"))
+            return None
+
+    def _clear_current_proc(self, p):
+        with self._proc_lock:
+            if self._current_proc is p:
+                self._current_proc = None
+
+    def _terminate_current_proc(self):
+        with self._proc_lock:
+            p = self._current_proc
+        if p is None:
+            return
+        try:
+            self.worker_queue.put(("log","Deteniendo proceso en curso…"))
+            p.terminate()
+            try:
+                p.wait(timeout=3)
+            except Exception:
+                self.worker_queue.put(("log","Forzando cierre de proceso…"))
+                p.kill()
+        except Exception as e:
+            self.worker_queue.put(("log", f"ERROR al terminar proceso: {e}"))
+        finally:
+            self._clear_current_proc(p)
+
+    def _popen_capture_any(self, args, cwd=None, env=None):
+        if not self.running: return 1, ""
+        env=self._ensure_utf8_in_env(env)
+        p = self._launch_proc(args, cwd=cwd, env=env)
+        if p is None: return 127, ""
+        try:
+            out,_=p.communicate()
+            self._clear_current_proc(p)
+            return p.returncode, out
+        except Exception as e:
+            self._clear_current_proc(p)
             return 1, f"ERROR ejecutando {args}: {e}"
+
     def _popen_run_any(self, args, cwd=None, env=None):
         rc, out = self._popen_capture_any(args, cwd, env)
         if out: self.worker_queue.put(("log", out.strip()))
         return rc
+
     def _run_cmd(self, args, cwd, stream=True, env=None):
+        if not self.running: return 1
         si, cf = self._startupinfo_flags()
         env = self._git_env(cwd) if (env is None and args and args[0]=="git" and cwd) else self._ensure_utf8_in_env(env)
+        p = self._launch_proc(args, cwd=cwd, env=env)
+        if p is None: return 127
         try:
-            p = subprocess.Popen(args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                 text=True, encoding="utf-8", errors="replace",
-                                 startupinfo=si, creationflags=cf, env=env)
             if stream:
                 for line in iter(p.stdout.readline, ""):
+                    if not self.running:
+                        break
                     if line: self.worker_queue.put(("log", line.rstrip("\r\n")))
-                p.wait(); return p.returncode
+                p.wait()
+                rc = p.returncode
             else:
                 out = p.communicate()[0]
+                rc = p.returncode
                 if out: self.worker_queue.put(("log", out.strip()))
-                return p.returncode
-        except FileNotFoundError:
-            self.worker_queue.put(("log", f"ERROR: comando no encontrado: {args[0]}")); return 127
+            self._clear_current_proc(p)
+            return rc
         except Exception as e:
+            self._clear_current_proc(p)
             self.worker_queue.put(("log", f"ERROR ejecutando {args}: {e}")); return 1
+
     def _run_cmd_capture(self, args, cwd, env=None):
         if not self.running: return (1, "")
-        si, cf = self._startupinfo_flags()
         env = self._git_env(cwd) if (env is None and args and args[0]=="git" and cwd) else self._ensure_utf8_in_env(env)
-        try:
-            p = subprocess.Popen(args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                 text=True, encoding="utf-8", errors="replace",
-                                 startupinfo=si, creationflags=cf, env=env)
-            out,_=p.communicate()
-            if out: self.worker_queue.put(("log", out.strip()))
-            return p.returncode, out
-        except Exception as e:
-            txt=f"ERROR ejecutando {args}: {e}"; self.worker_queue.put(("log", txt)); return (1, txt)
+        return self._popen_capture_any(args, cwd, env)
+
     def _run_check_output(self, args, cwd=None, env=None):
+        # Se usa en bloques muy puntuales; no se cancela aquí.
         si, cf = self._startupinfo_flags()
         env = self._git_env(cwd) if (env is None and args and args[0]=="git" and cwd) else self._ensure_utf8_in_env(env)
         return subprocess.check_output(args, cwd=cwd, text=True, encoding="utf-8",
@@ -1206,6 +1267,9 @@ class App(tk.Tk):
             except Exception: cur=""
             self.worker_queue.put(("log", f"DEBUG push -> remote get-url origin: {cur}"))
 
+            if not self.running:
+                return 1
+
             rc = self._push_explicit_main(project_path)
             if rc==0:
                 self.worker_queue.put(("log","✅ Push exitoso"))
@@ -1297,6 +1361,7 @@ class App(tk.Tk):
         subs = self.cfg.get("selected_subfolders", []) or []
         files = self.cfg.get("selected_files", []) or []
         if not subs and not files:
+            self.worker_queue.put(("log", "📦 Agregando archivos (todo el proyecto)…"))
             return self._run_cmd(["git","add","."], cwd=project_path) == 0
 
         self.worker_queue.put(("log", f"📦 Agregando solo selección ({len(subs)} subcarpetas / {len(files)} archivos)…"))
@@ -1348,9 +1413,12 @@ class App(tk.Tk):
             self._ensure_gitignore(project_path)
             self._preclean_tmp_and_sensitive(project_path)
 
-            exe_name = os.path.basename(sys.executable) if getattr(sys,'frozen',False) else None
-            to_untrack = ["config.json","log.txt","config_autogit.json","config_autogit.json.tmp","log_autogit.txt"]
-            if exe_name: to_untrack.append(exe_name)
+            # Asegurar que NO se trackee autogit.exe ni el ejecutable actual congelado (si aplica)
+            exe_name_static = "autogit.exe"
+            exe_name_frozen = os.path.basename(sys.executable) if getattr(sys,'frozen',False) else None
+            to_untrack = ["config.json","log.txt","config_autogit.json","config_autogit.json.tmp","log_autogit.txt", exe_name_static]
+            if exe_name_frozen and exe_name_frozen not in to_untrack:
+                to_untrack.append(exe_name_frozen)
             self._untrack_list(project_path, to_untrack)
 
             large=self._scan_large_files(project_path)
@@ -1420,6 +1488,9 @@ class App(tk.Tk):
                 origin_url=self._build_origin(method, gh_user, repo_name)
                 self._ensure_origin(project_path, origin_url)
 
+            if not self.running:
+                self.worker_queue.put(("done",None)); return
+
             # push
             self.worker_queue.put(("log","🚀 Subiendo cambios al repositorio remoto…"))
             rc=self._git_push_with_retries(project_path, "origin", "main")
@@ -1465,7 +1536,15 @@ class App(tk.Tk):
 
     def _stop_pipeline(self):
         if not self.running: self._status("No hay proceso en ejecución."); return
-        self.running=False; self._append_log("Solicitud de detener recibida… (termina el paso actual)")
+        # Señal de stop + matar proceso en curso
+        self.running=False
+        self._terminate_current_proc()
+        self._append_log("🛑 Detención solicitada por el usuario. Se cancelará el paso actual y no se iniciarán nuevos pasos.")
+        self.btn_stop.config(state="disabled")
+        self.btn_run.config(state="normal")
+        # Si el autocierre está habilitado, reactivar countdown
+        if self.autoclose_var.get():
+            self._schedule_autoclose()
 
     def _poll_worker_queue(self):
         try:
@@ -1491,6 +1570,12 @@ class App(tk.Tk):
         try:
             self.cfg["window_geometry"]=self.geometry(); safe_write_json(CONFIG_PATH,self.cfg)
         except: pass
+        # Si hay proceso en curso, terminarlo para no dejarlo huérfano
+        try:
+            self.running=False
+            self._terminate_current_proc()
+        except Exception:
+            pass
         log_line("Aplicación cerrada por el usuario."); self.destroy()
 
     # ---------- Ayuda ----------

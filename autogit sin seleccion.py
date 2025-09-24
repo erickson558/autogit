@@ -1,17 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-Git Helper GUI – v0.3.4
-Cambios 0.3.4:
-- (FIX) Se restauran métodos de autocierre: _schedule_autoclose, _cancel_autoclose, _tick_countdown
-- Mantiene 0.3.3:
-  - Prelimpieza de *.tmp y config_autogit.json.tmp antes de add
-  - GH013: purgado agresivo (config_autogit.json*, *.tmp, .cfg_*.tmp, autogit*.exe)
-  - Push explícito HEAD:refs/heads/main (normal y --force)
-  - Origin con x-access-token:<PAT> y helpers desactivados
+Git Helper GUI – v0.3.7
+Cambios 0.3.7:
+- Selector forzado de archivos (multi-ruta) con filtro (*.py;*.txt) y búsqueda.
+- Countdown vuelve a statusbar y al título de la ventana; también se imprime en el log.
+- Cancelación segura de after() al cerrar (poll, countdowns) para evitar "invalid command name".
+- Se mantienen selecciones y geometry.
+
+Mantiene 0.3.6:
+- Selector de subcarpetas (multi) y archivos (nativo) con persistencia.
+- Pipeline respeta alcance (subcarpetas/archivos seleccionados) o usa git add . si no hay selección.
+- Badge con conteo "Subcarpetas: X | Archivos: Y".
 """
 
 import os, sys, json, hashlib, threading, datetime, queue, traceback, subprocess, time
-import shutil, random
+import shutil, random, fnmatch
 
 try:
     import tkinter as tk
@@ -37,7 +40,6 @@ def log_line(msg):
         pass
 
 def safe_write_json(path, data, retries=10, base_delay=0.05):
-    """Escritura robusta sin dejar *.tmp en el repo."""
     try:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     except Exception:
@@ -86,8 +88,7 @@ def file_hash(path):
 
 def bump_version(v):
     try:
-        a,b,c = (list(map(int,(v.split(".")+["0","0","0"])[:3])))
-        c += 1
+        a,b,c = (list(map(int,(v.split(".")+["0","0","0"])[:3]))); c += 1
         return f"{a}.{b}.{c}"
     except: return INITIAL_VERSION
 
@@ -119,6 +120,7 @@ def _unmojibake_if_needed(s):
         pass
     return s
 
+# ----------------- CONFIG POR DEFECTO -----------------
 DEFAULT_CONFIG = {
     "version": INITIAL_VERSION,
     "last_code_hash": "",
@@ -150,6 +152,10 @@ DEFAULT_CONFIG = {
 
     "max_file_size_mb": 95,
 
+    # Alcance de commit/push
+    "selected_subfolders": [],   # rutas relativas
+    "selected_files": [],        # rutas relativas
+
     # PATRONES SENSIBLES QUE SE PURGAN SI GH013
     "history_purge_patterns": [
         "autogit.exe", "autogit*.exe",
@@ -180,6 +186,163 @@ GITIGNORE_LINES = [
     "Thumbs.db",
 ]
 
+# ----------------- DIALOGO SUBCARPETAS -----------------
+class SubfolderDialog(tk.Toplevel):
+    def __init__(self, master, root_path, preselected):
+        super().__init__(master)
+        self.title("Seleccionar subcarpetas…")
+        self.root_path = root_path
+        self.geometry("+{}+{}".format(master.winfo_rootx()+80, master.winfo_rooty()+80))
+        self.configure(bg="#101418"); self.resizable(True, True)
+
+        frm = ttk.Frame(self); frm.pack(fill="both", expand=True, padx=12, pady=12)
+        ttk.Label(frm, text="Marca las subcarpetas a incluir (doble clic para alternar):").pack(anchor="w")
+
+        self.lb = tk.Listbox(frm, selectmode="extended", activestyle="dotbox",
+                             bg="#0F1620", fg="#C9D1D9", relief="flat")
+        self.lb.pack(fill="both", expand=True, pady=6)
+        sb = ttk.Scrollbar(frm, orient="vertical", command=self.lb.yview); sb.pack(side="right", fill="y")
+        self.lb.configure(yscrollcommand=sb.set)
+
+        items = []
+        for r, dnames, _ in os.walk(root_path):
+            if ".git" in dnames: dnames.remove(".git")
+            rel = os.path.relpath(r, root_path)
+            if rel == ".": continue
+            items.append(rel.replace("\\","/"))
+        items.sort()
+        for rel in items: self.lb.insert("end", rel)
+
+        preset = set([p.replace("\\","/") for p in preselected or []])
+        for i, rel in enumerate(items):
+            if rel in preset: self.lb.selection_set(i)
+
+        btns = ttk.Frame(frm); btns.pack(fill="x", pady=(6,0))
+        ttk.Button(btns, text="Marcar todo", command=lambda: self.lb.selection_set(0, "end")).pack(side="left")
+        ttk.Button(btns, text="Desmarcar todo", command=lambda: self.lb.selection_clear(0, "end")).pack(side="left", padx=6)
+        ttk.Button(btns, text="Aceptar", command=self._ok).pack(side="right")
+        ttk.Button(btns, text="Cancelar", command=self._cancel).pack(side="right", padx=6)
+
+        self._result = None
+        self.bind("<Escape>", lambda e: self._cancel())
+        self.lb.bind("<Double-Button-1>", lambda e: self._toggle_under_cursor())
+
+    def _toggle_under_cursor(self):
+        idx = self.lb.curselection()
+        if not idx: return
+        i = idx[0]
+        if self.lb.selection_includes(i): self.lb.selection_clear(i)
+        else: self.lb.selection_set(i)
+
+    def _ok(self):
+        items = [self.lb.get(i) for i in self.lb.curselection()]
+        self._result = items
+        self.destroy()
+
+    def _cancel(self):
+        self._result = None
+        self.destroy()
+
+    def result(self): return self._result
+
+# ----------------- DIALOGO ARCHIVOS FORZADO -----------------
+class FileSelectorDialog(tk.Toplevel):
+    """
+    Lista TODOS los archivos del proyecto (recursivo) y permite filtrar por patrón (*.py;*.txt)
+    y buscar por texto. Selección múltiple en una sola pasada.
+    """
+    def __init__(self, master, root_path, preselected):
+        super().__init__(master)
+        self.title("Selector forzado de archivos…")
+        self.root_path = root_path
+        self.geometry("720x520+{}+{}".format(master.winfo_rootx()+60, master.winfo_rooty()+60))
+        self.configure(bg="#101418"); self.resizable(True, True)
+
+        self._all_items = []    # todas las rutas relativas
+        self._filtered = []     # rutas tras filtro
+        self._pre = set([p.replace("\\","/") for p in preselected or []])
+
+        top = ttk.Frame(self); top.pack(fill="x", padx=12, pady=(12,4))
+        ttk.Label(top, text="Patrón (*.py;*.txt;*.*):").pack(side="left")
+        self.pat_var = tk.StringVar(value="*.*")
+        e_pat = ttk.Entry(top, width=24, textvariable=self.pat_var); e_pat.pack(side="left", padx=6)
+        ttk.Label(top, text="Buscar:").pack(side="left", padx=(12,0))
+        self.q_var = tk.StringVar(value="")
+        e_q = ttk.Entry(top, width=28, textvariable=self.q_var); e_q.pack(side="left", padx=6)
+        ttk.Button(top, text="Aplicar", command=self._apply_filters).pack(side="left", padx=6)
+
+        mid = ttk.Frame(self); mid.pack(fill="both", expand=True, padx=12, pady=6)
+        self.lb = tk.Listbox(mid, selectmode="extended", activestyle="dotbox",
+                             bg="#0F1620", fg="#C9D1D9", relief="flat")
+        self.lb.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(mid, orient="vertical", command=self.lb.yview); sb.pack(side="right", fill="y")
+        self.lb.configure(yscrollcommand=sb.set)
+
+        bot = ttk.Frame(self); bot.pack(fill="x", padx=12, pady=(6,12))
+        ttk.Button(bot, text="Marcar todo (filtrado)", command=lambda: self.lb.selection_set(0,"end")).pack(side="left")
+        ttk.Button(bot, text="Desmarcar", command=lambda: self.lb.selection_clear(0,"end")).pack(side="left", padx=6)
+        ttk.Button(bot, text="Aceptar", command=self._ok).pack(side="right")
+        ttk.Button(bot, text="Cancelar", command=self._cancel).pack(side="right", padx=6)
+
+        # Poblar lista completa
+        self._scan_files()
+        # Eventos live
+        e_pat.bind("<Return>", lambda e: self._apply_filters())
+        e_q.bind("<Return>",   lambda e: self._apply_filters())
+        self.bind("<Escape>",  lambda e: self._cancel())
+        self.lb.bind("<Double-Button-1>", lambda e: self._toggle_under_cursor())
+
+    def _scan_files(self):
+        items = []
+        for r, dnames, fnames in os.walk(self.root_path):
+            if ".git" in dnames: dnames.remove(".git")
+            for n in fnames:
+                full = os.path.join(r, n)
+                rel  = os.path.relpath(full, self.root_path).replace("\\","/")
+                items.append(rel)
+        items.sort()
+        self._all_items = items
+        self._apply_filters()
+
+    def _apply_filters(self):
+        pat_str = self.pat_var.get().strip() or "*.*"
+        pats = [p.strip() for p in pat_str.split(";") if p.strip()]
+        query = self.q_var.get().strip().lower()
+        filt = []
+        for rel in self._all_items:
+            ok_pat = any(fnmatch.fnmatch(rel, p) for p in pats) if pats else True
+            ok_q   = (query in rel.lower()) if query else True
+            if ok_pat and ok_q: filt.append(rel)
+        self._filtered = filt
+        self._reload_listbox()
+
+    def _reload_listbox(self):
+        self.lb.delete(0, "end")
+        for rel in self._filtered:
+            self.lb.insert("end", rel)
+        # Preselección: sólo si está en filtrado
+        for i, rel in enumerate(self._filtered):
+            if rel in self._pre: self.lb.selection_set(i)
+
+    def _toggle_under_cursor(self):
+        idx = self.lb.curselection()
+        if not idx: return
+        i = idx[0]
+        if self.lb.selection_includes(i): self.lb.selection_clear(i)
+        else: self.lb.selection_set(i)
+
+    def _ok(self):
+        items = [self.lb.get(i) for i in self.lb.curselection()]
+        self._result = items
+        self.destroy()
+
+    def _cancel(self):
+        self._result = None
+        self.destroy()
+
+    def result(self): return getattr(self, "_result", None)
+
+# ----------------- APP -----------------
 class AboutDialog(tk.Toplevel):
     def __init__(self, master, version):
         super().__init__(master)
@@ -198,6 +361,7 @@ class AboutDialog(tk.Toplevel):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
+        self._poll_job = None
         self.title(APP_NAME); self.configure(bg="#0B0F14")
         self.cfg = safe_read_json(CONFIG_PATH, DEFAULT_CONFIG.copy())
 
@@ -226,12 +390,12 @@ class App(tk.Tk):
         self.worker_queue  = queue.Queue()
         self.running = False
         self.countdown_job = None
+        self.countdown_log_job = None
         self.autoclose_remaining = 0
 
         if self.cfg.get("shortcuts_enabled", True): self._bind_shortcuts()
-        self.after(100, self._poll_worker_queue)
+        self._poll_job = self.after(100, self._poll_worker_queue)
 
-        # (FIX) estos métodos existen ahora
         if self.cfg.get("autoclose_enabled", False): self._schedule_autoclose()
         if self.cfg.get("autostart", True): self.after(300, self._start_pipeline)
 
@@ -387,6 +551,19 @@ class App(tk.Tk):
                         command=lambda: self._on_bool_change("create_readme_if_missing", self.create_readme_var.get())
                         ).pack(side="left", padx=(10,0))
 
+        # ------------------ Alcance commit/push ------------------
+        scope = ttk.LabelFrame(body, text="Alcance del commit/push"); scope.pack(fill="x", pady=(10,6))
+        ttk.Label(scope, text="Si dejas vacías las listas, se usará todo el proyecto (git add .)").pack(anchor="w", padx=6, pady=2)
+
+        btns_scope = ttk.Frame(scope); btns_scope.pack(fill="x", padx=6, pady=4)
+        ttk.Button(btns_scope, text="Seleccionar subcarpetas…", command=self._open_subfolder_selector).pack(side="left")
+        ttk.Button(btns_scope, text="Seleccionar archivos…",   command=self._open_file_selector_native).pack(side="left", padx=8)
+        ttk.Button(btns_scope, text="Selector forzado (archivos)…",   command=self._open_file_selector_forced).pack(side="left")
+        self.scope_badge_var = tk.StringVar()
+        self._update_scope_badge()
+        ttk.Label(btns_scope, textvariable=self.scope_badge_var).pack(side="right")
+
+        # ------------------ Botones principales ------------------
         rowG = ttk.Frame(body); rowG.pack(fill="x", pady=(12,6))
         self.btn_run  = ttk.Button(rowG, text="Ejecutar pipeline (Ctrl+R)", command=self._start_pipeline)
         self.btn_test = ttk.Button(rowG, text="Test PAT Token (Ctrl+T)", command=self._test_pat_token)
@@ -395,12 +572,15 @@ class App(tk.Tk):
         self.btn_run.pack(side="left"); self.btn_test.pack(side="left", padx=8)
         self.btn_stop.pack(side="left", padx=8); self.btn_exit.pack(side="right")
 
+        # ------------------ Log ------------------
         logf = ttk.Frame(body); logf.pack(fill="both", expand=True, pady=(8,8))
-        self.txt_log = tk.Text(logf, height=14, bg="#0F1620", fg="#C9D1D9", insertbackground="#C9D1D9", relief="flat", wrap="word")
+        self.txt_log = tk.Text(logf, height=14, bg="#0F1620", fg="#C9D1D9",
+                               insertbackground="#C9D1D9", relief="flat", wrap="word")
         self.txt_log.pack(side="left", fill="both", expand=True)
         sb = ttk.Scrollbar(logf, orient="vertical", command=self.txt_log.yview); sb.pack(side="right", fill="y")
         self.txt_log.configure(yscrollcommand=sb.set)
 
+        # ------------------ Statusbar ------------------
         status = tk.Frame(self, bg="#0A0E12", bd=1, relief="sunken", height=24)
         status.pack(side="bottom", fill="x"); status.pack_propagate(False)
         self.status_var = tk.StringVar(value=self.cfg.get("status_text","Listo."))
@@ -420,32 +600,69 @@ class App(tk.Tk):
     def _status(self, txt):
         self.status_var.set(txt); self.cfg["status_text"]=txt; safe_write_json(CONFIG_PATH, self.cfg)
 
-    # ---------- Autocierre (restaurado) ----------
+    # ---------- Título ----------
+    def _set_title(self, extra=None):
+        if extra:
+            self.title(f"{APP_NAME} — {extra}")
+        else:
+            self.title(APP_NAME)
+
+    # ---------- Autocierre + Countdown ----------
     def _schedule_autoclose(self):
         self._cancel_autoclose()
         try:
             secs = int(self.cfg.get("autoclose_seconds", 60))
-        except:
-            secs = 60
+        except: secs = 60
         if secs < 1: secs = 1
         self.autoclose_remaining = secs
-        self.countdown_var.set(f"Auto-cierre: {self.autoclose_remaining} s")
+        self._update_countdown_ui()
+        self._start_log_countdown()
         self.countdown_job = self.after(1000, self._tick_countdown)
+
+    def _update_countdown_ui(self):
+        txt = f"Cerrando en {self.autoclose_remaining}s"
+        self.countdown_var.set(txt)
+        self._set_title(txt)
+
+    def _start_log_countdown(self):
+        self._cancel_log_countdown()
+        self._append_log(f"[auto-cierre] Cerrando en {self.autoclose_remaining}s…")
+        self.countdown_log_job = self.after(1000, self._tick_log_countdown)
+
+    def _tick_log_countdown(self):
+        if not self.autoclose_var.get() or self.running:
+            self._cancel_log_countdown(); return
+        self.autoclose_remaining -= 1
+        if self.autoclose_remaining <= 0:
+            self._append_log("[auto-cierre] Cerrando en 0s…")
+            self._cancel_log_countdown()
+            return
+        self._append_log(f"[auto-cierre] Cerrando en {self.autoclose_remaining}s…")
+        self._update_countdown_ui()
+        self.countdown_log_job = self.after(1000, self._tick_log_countdown)
+
+    def _cancel_log_countdown(self):
+        if self.countdown_log_job is not None:
+            try: self.after_cancel(self.countdown_log_job)
+            except: pass
+            self.countdown_log_job = None
 
     def _cancel_autoclose(self):
         if self.countdown_job is not None:
             try: self.after_cancel(self.countdown_job)
             except: pass
             self.countdown_job = None
+        self._cancel_log_countdown()
         self.countdown_var.set("")
+        self._set_title(None)
 
     def _tick_countdown(self):
         if not self.autoclose_var.get():
             self._cancel_autoclose(); return
         self.autoclose_remaining -= 1
         if self.autoclose_remaining <= 0:
-            self.countdown_var.set("Auto-cierre: 0 s"); self.on_close(); return
-        self.countdown_var.set(f"Auto-cierre: {self.autoclose_remaining} s")
+            self.on_close(); return
+        self._update_countdown_ui()
         self.countdown_job = self.after(1000, self._tick_countdown)
 
     # ---------- Config handlers ----------
@@ -471,31 +688,92 @@ class App(tk.Tk):
             self.project_path_var.set(self.cfg["project_path"])
         else:
             self.cfg["project_path"] = self.project_path_var.get()
+        # Limpia selecciones al cambiar la ruta
+        self.cfg["selected_subfolders"] = []
+        self.cfg["selected_files"] = []
         safe_write_json(CONFIG_PATH, self.cfg)
+        self._update_scope_badge()
         if not self.repo_name_var.get(): self._autodetect_repo_name()
+
     def _browse_folder(self):
         if self.cfg.get("follow_exe_folder", True):
             self._status("Bloqueado por 'Usar carpeta del ejecutable'."); return
         path = filedialog.askdirectory(initialdir=self.project_path_var.get() or app_dir(), title="Selecciona la carpeta del proyecto")
         if path:
             self.project_path_var.set(path); self._on_project_path_change()
+
     def _browse_ssh_key(self):
         path = filedialog.askopenfilename(initialdir=os.path.expanduser("~"), title="Selecciona tu clave privada",
                                           filetypes=[("Claves", "*"), ("Todos", "*.*")])
         if path:
             self.ssh_key_var.set(path); self._on_str_change("ssh_key_path", self.ssh_key_var.get())
+
     def _autodetect_repo_name(self):
         p = self.project_path_var.get().strip() or app_dir()
         repo = os.path.basename(os.path.normpath(p)) or ""
         if repo:
             self.repo_name_var.set(repo); self._on_str_change("repo_name", repo)
             self._status(f"Repo autodetectado: {repo}")
+
     def _bump_on_config_change(self, reason=""):
         old=self.cfg.get("version",INITIAL_VERSION); new=bump_version(old)
         self.cfg["version"]=new; safe_write_json(CONFIG_PATH,self.cfg)
         try: self.version_label.config(text=f"Versión: {new}")
         except: pass
         log_line(f"Version bump por cambio de config ({reason}): {old} -> {new}")
+
+    # ---------- Alcance (UI) ----------
+    def _update_scope_badge(self):
+        subs = self.cfg.get("selected_subfolders", []) or []
+        files = self.cfg.get("selected_files", []) or []
+        self.scope_badge_var.set(f"Subcarpetas: {len(subs)} | Archivos: {len(files)}")
+
+    def _rel_safe(self, full):
+        root = os.path.normpath(self.project_path_var.get().strip() or app_dir())
+        full = os.path.normpath(full)
+        try:
+            rel = os.path.relpath(full, root)
+        except ValueError:
+            return None
+        if rel.startswith(".."): return None
+        return rel.replace("\\","/")
+
+    def _open_subfolder_selector(self):
+        root = self.project_path_var.get().strip() or app_dir()
+        pre = self.cfg.get("selected_subfolders", []) or []
+        dlg = SubfolderDialog(self, root, pre)
+        self.wait_window(dlg)
+        result = dlg.result()
+        if result is None: return
+        self.cfg["selected_subfolders"] = sorted(set(result))
+        safe_write_json(CONFIG_PATH, self.cfg)
+        self._update_scope_badge()
+        self._append_log(f"Subcarpetas seleccionadas: {len(result)}")
+
+    def _open_file_selector_native(self):
+        root = self.project_path_var.get().strip() or app_dir()
+        paths = filedialog.askopenfilenames(initialdir=root, title="Selecciona archivos…")
+        if not paths: return
+        rels = []
+        for p in paths:
+            r = self._rel_safe(p)
+            if r: rels.append(r)
+        self.cfg["selected_files"] = sorted(set(rels))
+        safe_write_json(CONFIG_PATH, self.cfg)
+        self._update_scope_badge()
+        self._append_log(f"Archivos seleccionados: {len(rels)}")
+
+    def _open_file_selector_forced(self):
+        root = self.project_path_var.get().strip() or app_dir()
+        pre  = self.cfg.get("selected_files", []) or []
+        dlg = FileSelectorDialog(self, root, pre)
+        self.wait_window(dlg)
+        result = dlg.result()
+        if result is None: return
+        self.cfg["selected_files"] = sorted(set(result))
+        safe_write_json(CONFIG_PATH, self.cfg)
+        self._update_scope_badge()
+        self._append_log(f"Archivos seleccionados (forzado): {len(result)}")
 
     # ---------- Log ----------
     def _append_log(self, txt):
@@ -755,11 +1033,12 @@ class App(tk.Tk):
                 p=os.path.join(root,name)
                 try:
                     if os.path.getsize(p)>limit:
-                        rel=os.path.relpath(p, project_path); big.append(rel)
+                        rel=os.path.relpath(p, project_path).replace("\\","/")
+                        big.append(rel)
                 except: pass
         sp=os.path.join(project_path,"autogit.exe")
         if os.path.exists(sp):
-            rel=os.path.relpath(sp, project_path)
+            rel=os.path.relpath(sp, project_path).replace("\\","/")
             if rel not in big: big.append(rel)
         return big
 
@@ -901,10 +1180,10 @@ class App(tk.Tk):
 
     # ---------- Push ----------
     def _push_explicit_main(self, project_path):
-        rc, out = self._run_cmd_capture(["git","push","-u","origin","HEAD:refs/heads/main"], project_path)
+        rc, _ = self._run_cmd_capture(["git","push","-u","origin","HEAD:refs/heads/main"], project_path)
         return rc
     def _force_push_explicit_main(self, project_path):
-        rc, out = self._run_cmd_capture(["git","push","--force","origin","HEAD:refs/heads/main"], project_path)
+        rc, _ = self._run_cmd_capture(["git","push","--force","origin","HEAD:refs/heads/main"], project_path)
         return rc
 
     def _git_push_with_retries(self, project_path, origin="origin", branch="main"):
@@ -1004,7 +1283,6 @@ class App(tk.Tk):
 
     # ---------- Pipeline ----------
     def _preclean_tmp_and_sensitive(self, project_path):
-        """Borra archivos temporales y los saca del índice para que no vuelvan a colarse."""
         for root, dirs, files in os.walk(project_path):
             if ".git" in dirs: dirs.remove(".git")
             for n in files:
@@ -1014,6 +1292,28 @@ class App(tk.Tk):
                     except Exception: pass
         self._untrack_list(project_path, ["config_autogit.json.tmp"])
         self._append_gitignore_patterns(project_path, ["config_autogit.json.tmp","*.tmp",".cfg_*.tmp"])
+
+    def _git_add_scope(self, project_path):
+        subs = self.cfg.get("selected_subfolders", []) or []
+        files = self.cfg.get("selected_files", []) or []
+        if not subs and not files:
+            return self._run_cmd(["git","add","."], cwd=project_path) == 0
+
+        self.worker_queue.put(("log", f"📦 Agregando solo selección ({len(subs)} subcarpetas / {len(files)} archivos)…"))
+        ok = True
+        for rel in subs:
+            rel = rel.replace("\\","/")
+            full = os.path.join(project_path, rel)
+            if os.path.isdir(full):
+                rc = self._run_cmd(["git","add", rel], cwd=project_path)
+                if rc != 0: ok = False
+        for rel in files:
+            rel = rel.replace("\\","/")
+            full = os.path.join(project_path, rel)
+            if os.path.isfile(full):
+                rc = self._run_cmd(["git","add", rel], cwd=project_path)
+                if rc != 0: ok = False
+        return ok
 
     def _worker_pipeline(self, project_path, repo_name, commit_msg, create_readme):
         try:
@@ -1064,13 +1364,11 @@ class App(tk.Tk):
                     with open(readme_path,"w",encoding="utf-8") as f:
                         f.write(f"# {repo_name}\n\nProyecto {repo_name}.\n")
 
-            self.worker_queue.put(("log","📦 Agregando archivos al staging…"))
-            rc=self._run_cmd(["git","add","."], cwd=project_path)
-            if rc!=0:
+            # --- ADD con alcance ---
+            if not self._git_add_scope(project_path):
                 if self._remove_index_lock_if_any(project_path):
-                    rc=self._run_cmd(["git","add","."], cwd=project_path)
-                if rc!=0:
-                    self.worker_queue.put(("log","ERROR en git add .")); self.worker_queue.put(("done",None)); return
+                    if not self._git_add_scope(project_path):
+                        self.worker_queue.put(("log","ERROR en git add.")); self.worker_queue.put(("done",None)); return
 
             # commit
             si, cf = self._startupinfo_flags()
@@ -1153,10 +1451,13 @@ class App(tk.Tk):
             messagebox.showerror("PAT Token Requerido","Debes configurar un Personal Access Token (PAT) de GitHub.\n\nPresiona Ctrl+T para testear el token o F2 para instrucciones.")
             return
 
+        # Comienza ejecución → cancelar countdown visual/log
+        self._cancel_autoclose()
+
         self.running=True; self.btn_run.config(state="disabled"); self.btn_stop.config(state="normal")
         self._status("Ejecutando pipeline…")
         self._append_log(f"Iniciando pipeline en: {proj} (repo: {repo})")
-        self._cancel_autoclose()
+
         t=threading.Thread(target=self._worker_pipeline,
                            args=(proj,repo,self.commit_message_var.get().strip() or "Actualización automática",
                                  self.create_readme_var.get()), daemon=True)
@@ -1174,14 +1475,19 @@ class App(tk.Tk):
                 elif kind=="stat": self._status(payload)
                 elif kind=="done":
                     self.running=False; self.btn_run.config(state="normal"); self.btn_stop.config(state="disabled")
-                    # Si quieres reactivar autocierre al terminar, descomenta:
+                    # reactiva autocierre si está habilitado
                     if self.autoclose_var.get():
                         self._schedule_autoclose()
         except queue.Empty:
             pass
-        self.after(120, self._poll_worker_queue)
+        self._poll_job = self.after(120, self._poll_worker_queue)
 
     def on_close(self):
+        # Cancela afters para evitar "invalid command name"
+        try:
+            if self._poll_job: self.after_cancel(self._poll_job)
+        except Exception: pass
+        self._cancel_autoclose()
         try:
             self.cfg["window_geometry"]=self.geometry(); safe_write_json(CONFIG_PATH,self.cfg)
         except: pass
