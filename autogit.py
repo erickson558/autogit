@@ -1,15 +1,25 @@
 # -*- coding: utf-8 -*-
 """
 Git Helper GUI – v0.4.0
-- ADD: Selección GUI de rutas a sincronizar (modo INCLUDE / EXCLUDE)
-- ADD: Staging respetando selección (incluir solo o subir todo excepto)
-- ADD: Añadir exclusiones a .gitignore automáticamente y quitar del índice
-- ADD: *.tmp en .gitignore por defecto (evita push-protection por temporales)
-- KEEP: Re-init limpio primera vez, limpieza histórica, PAT embebido en origin
+Cambios 0.4.0:
+- NUEVO: Selección opcional de contenido a subir:
+  - Subcarpetas a incluir (selector con lista editable)
+  - Archivos individuales a incluir (multi-selección)
+- Checkbox "Usar selección de carpetas/archivos": si está activo, el staging usa solo esas rutas
+- Contadores y persistencia en config_autogit.json
+- Validación automática cuando cambia la "Ruta del proyecto"
+
+Cambios 0.3.4:
+- (FIX) Se restauran métodos de autocierre: _schedule_autoclose, _cancel_autoclose, _tick_countdown
+- Mantiene 0.3.3:
+  - Prelimpieza de *.tmp y config_autogit.json.tmp antes de add
+  - GH013: purgado agresivo (config_autogit.json*, *.tmp, .cfg_*.tmp, autogit*.exe)
+  - Push explícito HEAD:refs/heads/main (normal y --force)
+  - Origin con x-access-token:<PAT> y helpers desactivados
 """
 
 import os, sys, json, hashlib, threading, datetime, queue, traceback, subprocess, time
-import base64, tempfile, shutil, random
+import shutil, random
 
 try:
     import tkinter as tk
@@ -26,7 +36,6 @@ def app_dir():
 CONFIG_PATH = os.path.join(app_dir(), "config_autogit.json")
 LOG_PATH    = os.path.join(app_dir(), "log_autogit.txt")
 
-# ---------- Utilidades ----------
 def log_line(msg):
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
@@ -36,7 +45,7 @@ def log_line(msg):
         pass
 
 def safe_write_json(path, data, retries=10, base_delay=0.05):
-    """Escribe JSON de forma robusta (locks OneDrive)."""
+    """Escritura robusta sin dejar *.tmp en el repo."""
     try:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     except Exception:
@@ -54,40 +63,22 @@ def safe_write_json(path, data, retries=10, base_delay=0.05):
             except PermissionError:
                 shutil.move(tmp_path, path)
             return
-        except PermissionError as e:
-            last_err = e
-            try:
-                if os.path.exists(tmp_path): os.remove(tmp_path)
-            except Exception: pass
-            time.sleep(base_delay * (2 ** attempt) + random.random() * 0.05)
         except Exception as e:
             last_err = e
             try:
                 if os.path.exists(tmp_path): os.remove(tmp_path)
             except Exception: pass
-            log_line(f"ERROR escribiendo JSON: {e}")
-            break
-    # Fallback final
-    try:
-        home_fallback = os.path.join(os.path.expanduser("~"), "config_autogit.local.json")
-        with open(home_fallback, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        log_line(f"⚠️ No se pudo reemplazar {path}. Guardado en {home_fallback}. Último error: {last_err}")
-    except Exception as e:
-        log_line(f"❌ FALLO guardando config. Último error: {last_err}. Fallback error: {e}")
+            time.sleep(base_delay * (2 ** attempt) + random.random() * 0.05)
+    log_line(f"⚠️ No se pudo guardar {path}. Último error: {last_err}")
 
 def safe_read_json(path, default):
-    """Lee JSON de forma segura. Si no existe o falla, devuelve default (mergeando claves)."""
     try:
-        if not os.path.exists(path):
-            return default
+        if not os.path.exists(path): return default
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-            if isinstance(data, dict):
-                merged = default.copy()
-                merged.update(data)
-                return merged
-            return default
+        if isinstance(data, dict):
+            merged = default.copy(); merged.update(data); return merged
+        return default
     except Exception as e:
         log_line(f"ERROR leyendo JSON {path}: {e}")
         return default
@@ -109,7 +100,6 @@ def bump_version(v):
     except: return INITIAL_VERSION
 
 def safe_rmtree(path, retries=10, base_delay=0.05):
-    """Elimina carpetas de forma robusta (locks en Windows/OneDrive)."""
     last = None
     for attempt in range(retries):
         try:
@@ -121,20 +111,14 @@ def safe_rmtree(path, retries=10, base_delay=0.05):
             try:
                 for root, dirs, files in os.walk(path):
                     for n in files:
-                        fp = os.path.join(root, n)
-                        try:
-                            os.chmod(fp, 0o666)
-                        except Exception:
-                            pass
-            except Exception:
-                pass
+                        try: os.chmod(os.path.join(root, n), 0o666)
+                        except Exception: pass
+            except Exception: pass
             time.sleep(base_delay * (2 ** attempt) + random.random() * 0.05)
     log_line(f"⚠️ No se pudo eliminar {path}: {last}")
     return False
 
-# ---------- Fix mojibake ----------
 def _unmojibake_if_needed(s):
-    """Corrige mojibake típico (UTF-8 leído como latin1)."""
     try:
         fixed = s.encode("latin1").decode("utf-8")
         if ("Ã" in s or "�" in s) and any(ch in fixed for ch in u"áéíóúñÁÉÍÓÚÑ"):
@@ -143,61 +127,61 @@ def _unmojibake_if_needed(s):
         pass
     return s
 
-# ---------- Config ----------
 DEFAULT_CONFIG = {
     "version": INITIAL_VERSION,
     "last_code_hash": "",
-    "window_geometry": "1040x720+100+100",
+    "window_geometry": "1040x780+100+100",
     "autostart": True,
     "autoclose_enabled": False,
     "autoclose_seconds": 60,
     "status_text": "Listo.",
     "shortcuts_enabled": True,
 
-    # Proyecto / repo
     "project_path": app_dir(),
     "repo_name": "",
     "follow_exe_folder": True,
 
-    # Git identity
+    # NUEVO: selección opcional de contenido
+    "use_custom_selection": False,
+    "selected_subfolders": [],  # rutas RELATIVAS a project_path
+    "selected_files": [],       # rutas RELATIVAS a project_path
+
     "git_user_name": "erickson558",
     "git_user_email": "erickson558@hotmail.com",
 
-    # Autenticación: "gh" | "https_pat" | "ssh"
     "auth_method": "https_pat",
     "github_user": "erickson558",
 
-    # HTTPS + PAT
     "pat_username": "erickson558",
     "pat_token": "",
     "pat_save_in_credential_manager": True,
 
-    # SSH
     "ssh_key_path": "",
 
-    # Commit / flujo
     "commit_message": "Actualización automática",
     "create_readme_if_missing": True,
 
-    # Grandes / limpieza historia
     "max_file_size_mb": 95,
-    "history_purge_patterns": ["autogit.exe", "autogit*.exe"],
+
+    # PATRONES SENSIBLES QUE SE PURGAN SI GH013
+    "history_purge_patterns": [
+        "autogit.exe", "autogit*.exe",
+        "config_autogit.json", "config_autogit.json.tmp",
+        "*.tmp", ".cfg_*.tmp"
+    ],
     "force_push_after_purge": True,
 
-    # Forzar re-init limpio si es primera vez
-    "clean_git_on_first_time": True,
-
-    # --- NUEVO: Selección de sincronización ---
-    "sync_mode": "exclude",     # "include" | "exclude"
-    "sync_paths": []            # rutas relativas (carpetas/archivos)
+    "clean_git_on_first_time": True
 }
 
-# .gitignore base
 GITIGNORE_LINES = [
     "# --- GitHelper default ---",
     "config.json",
     "log.txt",
     "config_autogit.json",
+    "config_autogit.json.tmp",
+    ".cfg_*.tmp",
+    "*.tmp",
     "log_autogit.txt",
     "*.exe",
     "*.pyc",
@@ -207,7 +191,6 @@ GITIGNORE_LINES = [
     "node_modules/",
     ".DS_Store",
     "Thumbs.db",
-    "*.tmp",        # NUEVO: evita temporales en commits (p. ej., config_autogit.json.tmp)
 ]
 
 class AboutDialog(tk.Toplevel):
@@ -225,13 +208,55 @@ class AboutDialog(tk.Toplevel):
         ttk.Button(frm, text="Cerrar (Esc)", command=self.destroy).pack()
         self.bind("<Escape>", lambda e: self.destroy())
 
+# ---------- Diálogos de selección ----------
+class _ListEditorDialog(tk.Toplevel):
+    """Base para editar listas (subcarpetas o archivos)."""
+    def __init__(self, master, title, items, on_add, on_remove, on_clear, render_hint):
+        super().__init__(master)
+        self.title(title); self.configure(bg="#0B0F14")
+        self.resizable(True, True)
+        self.geometry("+{}+{}".format(master.winfo_rootx()+100, master.winfo_rooty()+100))
+        frm = ttk.Frame(self); frm.pack(fill="both", expand=True, padx=12, pady=12)
+        ttk.Label(frm, text=render_hint).pack(anchor="w", pady=(0,6))
+        self.lb = tk.Listbox(frm, height=12, selectmode="extended", bg="#0F1620", fg="#C9D1D9",
+                             highlightthickness=0, bd=0)
+        self.lb.pack(fill="both", expand=True, side="left")
+        for it in items: self.lb.insert("end", it)
+        sb = ttk.Scrollbar(frm, orient="vertical", command=self.lb.yview); sb.pack(side="left", fill="y")
+        self.lb.configure(yscrollcommand=sb.set)
+
+        btns = ttk.Frame(frm); btns.pack(side="right", fill="y", padx=(8,0))
+        ttk.Button(btns, text="Añadir…", command=lambda: on_add(self)).pack(fill="x", pady=2)
+        ttk.Button(btns, text="Quitar", command=lambda: on_remove(self)).pack(fill="x", pady=2)
+        ttk.Button(btns, text="Vaciar", command=lambda: on_clear(self)).pack(fill="x", pady=2)
+        ttk.Separator(btns, orient="horizontal").pack(fill="x", pady=6)
+        ttk.Button(btns, text="Cerrar (Esc)", command=self.destroy).pack(fill="x")
+        self.bind("<Escape>", lambda e: self.destroy())
+
+    def selected_indices(self):
+        return list(self.lb.curselection())
+
+    def add_items(self, items):
+        for it in items:
+            if it not in self.lb.get(0, "end"):
+                self.lb.insert("end", it)
+
+    def remove_selected(self):
+        for i in reversed(self.selected_indices()):
+            self.lb.delete(i)
+
+    def clear_all(self):
+        self.lb.delete(0, "end")
+
+    def items(self):
+        return list(self.lb.get(0, "end"))
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_NAME); self.configure(bg="#0B0F14")
         self.cfg = safe_read_json(CONFIG_PATH, DEFAULT_CONFIG.copy())
 
-        # Bump versión si cambió el binario/script
         code_path = sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(__file__)
         h = file_hash(code_path)
         if h and h != self.cfg.get("last_code_hash",""):
@@ -242,7 +267,6 @@ class App(tk.Tk):
 
         self._build_style(); self._build_menu(); self._build_widgets()
 
-        # Forzar usar SIEMPRE la carpeta del ejecutable como project_path
         if self.cfg.get("follow_exe_folder", True):
             exe_dir = app_dir()
             self.project_path_var.set(exe_dir)
@@ -263,6 +287,7 @@ class App(tk.Tk):
         if self.cfg.get("shortcuts_enabled", True): self._bind_shortcuts()
         self.after(100, self._poll_worker_queue)
 
+        # (FIX) autocierre
         if self.cfg.get("autoclose_enabled", False): self._schedule_autoclose()
         if self.cfg.get("autostart", True): self.after(300, self._start_pipeline)
 
@@ -283,7 +308,6 @@ class App(tk.Tk):
 
     def _build_menu(self):
         menubar = tk.Menu(self, tearoff=0); self.config(menu=menubar)
-    
         m_app = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Aplicación", menu=m_app, underline=0)
         m_app.add_command(label="Ejecutar pipeline", accelerator="Ctrl+R", command=self._start_pipeline)
@@ -291,7 +315,6 @@ class App(tk.Tk):
         m_app.add_command(label="Detener", accelerator="Ctrl+D", command=self._stop_pipeline)
         m_app.add_separator()
         m_app.add_command(label="Salir", accelerator="Ctrl+Q", command=self.on_close)
-    
         m_help = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Ayuda", menu=m_help, underline=0)
         m_help.add_command(label="About", accelerator="F1", command=self._show_about)
@@ -342,6 +365,29 @@ class App(tk.Tk):
         e_repo.bind("<Return>",   lambda e: self._on_str_change("repo_name", self.repo_name_var.get()))
         ttk.Button(rowC, text="Autodetectar", command=self._autodetect_repo_name).pack(side="left", padx=(6,0))
 
+        # ---------- NUEVO: Selección opcional de subcarpetas/archivos ----------
+        rowSel = ttk.LabelFrame(body, text="Selección opcional de contenido a subir"); rowSel.pack(fill="x", pady=(8,6))
+        self.use_custom_selection_var = tk.BooleanVar(value=self.cfg.get("use_custom_selection", False))
+        ttk.Checkbutton(rowSel, text="Usar selección de carpetas/archivos (si no, se sube todo el proyecto)",
+                        variable=self.use_custom_selection_var,
+                        command=lambda: self._on_bool_change("use_custom_selection", self.use_custom_selection_var.get())
+                        ).grid(row=0, column=0, columnspan=4, sticky="w", padx=6, pady=6)
+
+        ttk.Label(rowSel, text="Subcarpetas incluidas:").grid(row=1, column=0, sticky="w", padx=6)
+        self.subfolder_count_var = tk.StringVar(value=f"{len(self.cfg.get('selected_subfolders', []))} sel.")
+        ttk.Label(rowSel, textvariable=self.subfolder_count_var).grid(row=1, column=1, sticky="w")
+        ttk.Button(rowSel, text="Editar…", command=self._open_subfolder_selector).grid(row=1, column=2, sticky="w", padx=6)
+
+        ttk.Label(rowSel, text="Archivos individuales:").grid(row=2, column=0, sticky="w", padx=6)
+        self.file_count_var = tk.StringVar(value=f"{len(self.cfg.get('selected_files', []))} sel.")
+        ttk.Label(rowSel, textvariable=self.file_count_var).grid(row=2, column=1, sticky="w")
+        ttk.Button(rowSel, text="Editar…", command=self._open_file_selector).grid(row=2, column=2, sticky="w", padx=6)
+
+        ttk.Button(rowSel, text="Reiniciar selección", command=self._reset_selection).grid(row=1, column=3, rowspan=2, sticky="e", padx=6)
+
+        for i in range(4): rowSel.grid_columnconfigure(i, weight=1)
+
+        # ---------- Resto de UI ----------
         rowD = ttk.Frame(body); rowD.pack(fill="x", pady=(8,4))
         ttk.Label(rowD, text="Git user.name:").pack(side="left")
         self.git_user_name_var = tk.StringVar(value=self.cfg.get("git_user_name",""))
@@ -370,7 +416,6 @@ class App(tk.Tk):
         e_ghu.bind("<FocusOut>", lambda e: self._on_str_change("github_user", self.github_user_var.get()))
         e_ghu.bind("<Return>",   lambda e: self._on_str_change("github_user", self.github_user_var.get()))
 
-        # PAT Token section
         pat_frame = ttk.Frame(rowE); pat_frame.grid(row=1, column=0, columnspan=5, sticky="we", padx=6, pady=6)
         ttk.Label(pat_frame, text="🔑 PAT Token (OBLIGATORIO):", foreground="#FF6B6B").pack(side="left")
         self.pat_token_var = tk.StringVar(value=self.cfg.get("pat_token",""))
@@ -421,35 +466,6 @@ class App(tk.Tk):
                         command=lambda: self._on_bool_change("create_readme_if_missing", self.create_readme_var.get())
                         ).pack(side="left", padx=(10,0))
 
-        # --- NUEVO: Selección de qué sincronizar ---
-        self.sync_mode_var = tk.StringVar(value=self.cfg.get("sync_mode", "exclude"))
-        self.sync_paths = list(self.cfg.get("sync_paths", []))
-
-        selframe = ttk.LabelFrame(body, text="Seleccionar qué sincronizar"); selframe.pack(fill="x", pady=(10,6))
-
-        rowM = ttk.Frame(selframe); rowM.pack(fill="x", pady=(4,4))
-        ttk.Label(rowM, text="Modo:").pack(side="left")
-        rb1 = ttk.Radiobutton(rowM, text="Incluir solo estas rutas", value="include",
-                              variable=self.sync_mode_var, command=self._on_sync_mode_change)
-        rb2 = ttk.Radiobutton(rowM, text="Subir todo excepto estas rutas", value="exclude",
-                              variable=self.sync_mode_var, command=self._on_sync_mode_change)
-        rb1.pack(side="left", padx=(8,12)); rb2.pack(side="left")
-
-        rowL = ttk.Frame(selframe); rowL.pack(fill="both", expand=True, pady=(6,4))
-        self.lb_paths = tk.Listbox(rowL, height=6, selectmode="extended", bg="#0F1620", fg="#C9D1D9")
-        self.lb_paths.pack(side="left", fill="both", expand=True)
-        sbp = ttk.Scrollbar(rowL, orient="vertical", command=self.lb_paths.yview); sbp.pack(side="right", fill="y")
-        self.lb_paths.configure(yscrollcommand=sbp.set)
-
-        for p in self.sync_paths:
-            self.lb_paths.insert("end", p)
-
-        rowB = ttk.Frame(selframe); rowB.pack(fill="x", pady=(6,2))
-        ttk.Button(rowB, text="Agregar carpeta…", command=self._add_folder_sync).pack(side="left")
-        ttk.Button(rowB, text="Agregar archivos…", command=self._add_files_sync).pack(side="left", padx=6)
-        ttk.Button(rowB, text="Quitar seleccionados", command=self._remove_selected_sync).pack(side="left", padx=6)
-        ttk.Button(rowB, text="Vaciar lista", command=self._clear_sync).pack(side="left", padx=6)
-
         rowG = ttk.Frame(body); rowG.pack(fill="x", pady=(12,6))
         self.btn_run  = ttk.Button(rowG, text="Ejecutar pipeline (Ctrl+R)", command=self._start_pipeline)
         self.btn_test = ttk.Button(rowG, text="Test PAT Token (Ctrl+T)", command=self._test_pat_token)
@@ -471,71 +487,7 @@ class App(tk.Tk):
         self.countdown_var = tk.StringVar(value="")
         ttk.Label(status, textvariable=self.countdown_var, style="Status.TLabel").pack(side="right", padx=10)
 
-    # ----- NUEVO: handlers selección sync -----
-    def _save_sync_selection(self):
-        self.cfg["sync_mode"] = self.sync_mode_var.get()
-        self.cfg["sync_paths"] = list(self.sync_paths)
-        safe_write_json(CONFIG_PATH, self.cfg)
-
-    def _on_sync_mode_change(self):
-        mode = self.sync_mode_var.get()
-        self._status(f"Modo de sincronización: {'Incluir solo' if mode=='include' else 'Todo excepto'}")
-        self._save_sync_selection()
-
-    def _add_folder_sync(self):
-        base = self.project_path_var.get().strip() or app_dir()
-        path = filedialog.askdirectory(initialdir=base, title="Selecciona carpeta a incluir/excluir")
-        if not path: return
-        proj = os.path.abspath(self.project_path_var.get().strip() or app_dir())
-        try:
-            rel = os.path.relpath(path, proj).replace("\\","/")
-        except ValueError:
-            messagebox.showerror("Ruta inválida", "La carpeta debe estar dentro del proyecto.")
-            return
-        if rel == ".": return
-        if rel not in self.sync_paths:
-            self.sync_paths.append(rel)
-            self.lb_paths.insert("end", rel)
-            self._save_sync_selection()
-
-    def _add_files_sync(self):
-        base = self.project_path_var.get().strip() or app_dir()
-        files = filedialog.askopenfilenames(initialdir=base, title="Selecciona archivos a incluir/excluir")
-        if not files: return
-        proj = os.path.abspath(self.project_path_var.get().strip() or app_dir())
-        added = 0
-        for f in files:
-            try:
-                rel = os.path.relpath(f, proj).replace("\\","/")
-            except ValueError:
-                continue
-            if rel and rel not in self.sync_paths:
-                self.sync_paths.append(rel)
-                self.lb_paths.insert("end", rel)
-                added += 1
-        if added:
-            self._save_sync_selection()
-
-    def _remove_selected_sync(self):
-        sel = list(self.lb_paths.curselection())
-        if not sel: return
-        sel.reverse()
-        for idx in sel:
-            val = self.lb_paths.get(idx)
-            try:
-                self.sync_paths.remove(val)
-            except ValueError:
-                pass
-            self.lb_paths.delete(idx)
-        self._save_sync_selection()
-
-    def _clear_sync(self):
-        if not self.sync_paths: return
-        self.sync_paths.clear()
-        self.lb_paths.delete(0, "end")
-        self._save_sync_selection()
-
-    # ---------- Atajos / About ----------
+    # ---------- Shortcuts / About ----------
     def _bind_shortcuts(self):
         self.bind_all("<Control-r>", lambda e: self._start_pipeline())
         self.bind_all("<Control-t>", lambda e: self._test_pat_token())
@@ -543,93 +495,94 @@ class App(tk.Tk):
         self.bind_all("<Control-q>", lambda e: self.on_close())
         self.bind_all("<F1>",        lambda e: self._show_about())
         self.bind_all("<F2>",        lambda e: self._show_pat_instructions())
-
     def _show_about(self): AboutDialog(self, self.cfg.get("version", INITIAL_VERSION))
-
     def _status(self, txt):
-        self.status_var.set(txt)
-        self.cfg["status_text"]=txt
+        self.status_var.set(txt); self.cfg["status_text"]=txt; safe_write_json(CONFIG_PATH, self.cfg)
+
+    # ---------- NUEVO: Helpers selección ----------
+    def _normalize_rel(self, path_abs):
+        base = os.path.abspath(self.project_path_var.get().strip() or app_dir())
         try:
-            safe_write_json(CONFIG_PATH, self.cfg)
-        except Exception as e:
-            log_line(f"STATUS: no se pudo guardar config: {e}")
+            rel = os.path.relpath(os.path.abspath(path_abs), base)
+        except Exception:
+            rel = path_abs
+        return rel.replace("\\","/")
 
-    # ---------- Config handlers ----------
-    def _on_bool_change(self, key, value):
-        self.cfg[key]=bool(value); safe_write_json(CONFIG_PATH,self.cfg); self._bump_on_config_change(f"{key}={value}")
-        self._status(f"Guardado {key} = {value}")
-        if key=="autoclose_enabled":
-            if value and not self.running: self._schedule_autoclose()
-            else: self._cancel_autoclose()
-
-    def _on_int_change(self, key, raw):
+    def _is_under_project(self, path_abs):
+        base = os.path.abspath(self.project_path_var.get().strip() or app_dir())
         try:
-            v = int(str(raw).strip())
-            v = 1 if v < 1 else (86400 if v > 86400 else v)
-        except:
-            v = DEFAULT_CONFIG.get(key, 60)
-        self.cfg[key] = v
+            ap = os.path.abspath(path_abs)
+            return os.path.commonpath([ap, base]) == base
+        except Exception:
+            return False
+
+    def _update_selection_counters(self):
+        self.subfolder_count_var.set(f"{len(self.cfg.get('selected_subfolders', []))} sel.")
+        self.file_count_var.set(f"{len(self.cfg.get('selected_files', []))} sel.")
+
+    def _reset_selection(self):
+        self.cfg["selected_subfolders"] = []
+        self.cfg["selected_files"] = []
         safe_write_json(CONFIG_PATH, self.cfg)
-        self._bump_on_config_change(f"{key}={v}")
-        self._status(f"Guardado {key} = {v}")
-        if key=="autoclose_seconds" and self.autoclose_var.get() and not self.running:
-            self._schedule_autoclose()
+        self._update_selection_counters()
+        self._bump_on_config_change("reset_selection")
+        self._status("Selección reiniciada.")
 
-    def _on_str_change(self, key, value):
-        self.cfg[key]=value; safe_write_json(CONFIG_PATH,self.cfg)
-        self._bump_on_config_change(f"{key}=len{len(str(value))}")
-        self._status(f"Guardado {key}")
+    def _open_subfolder_selector(self):
+        base = os.path.abspath(self.project_path_var.get().strip() or app_dir())
+        current = list(self.cfg.get("selected_subfolders", []))
 
-    def _on_project_path_change(self):
-        if self.cfg.get("follow_exe_folder", True):
-            self.cfg["project_path"] = app_dir()
-            self.project_path_var.set(self.cfg["project_path"])
-        else:
-            self.cfg["project_path"] = self.project_path_var.get()
+        def on_add(dlg:_ListEditorDialog):
+            # permitir multi-añadir con askdirectory repetido
+            path = filedialog.askdirectory(initialdir=base, title="Añadir subcarpeta (debe estar dentro del proyecto)")
+            if path and self._is_under_project(path):
+                rel = self._normalize_rel(path)
+                dlg.add_items([rel])
+            elif path:
+                messagebox.showwarning("Fuera del proyecto", "La carpeta seleccionada no pertenece a la ruta del proyecto.")
+        def on_remove(dlg:_ListEditorDialog):
+            dlg.remove_selected()
+        def on_clear(dlg:_ListEditorDialog):
+            dlg.clear_all()
+
+        dlg = _ListEditorDialog(self, "Subcarpetas incluidas",
+                                current, on_add, on_remove, on_clear,
+                                render_hint="Solo se aceptan subcarpetas dentro de la Ruta del proyecto.")
+        self.wait_window(dlg)
+        items = dlg.items()
+        # persistir
+        self.cfg["selected_subfolders"] = items
         safe_write_json(CONFIG_PATH, self.cfg)
-        if not self.repo_name_var.get(): self._autodetect_repo_name()
+        self._update_selection_counters()
+        self._bump_on_config_change("edit_subfolders")
+        self._status("Subcarpetas actualizadas.")
 
-    def _browse_folder(self):
-        if self.cfg.get("follow_exe_folder", True):
-            self._status("Bloqueado por 'Usar carpeta del ejecutable'.")
-            return
-        path = filedialog.askdirectory(initialdir=self.project_path_var.get() or app_dir(), title="Selecciona la carpeta del proyecto")
-        if path:
-            self.project_path_var.set(path); self._on_project_path_change()
+    def _open_file_selector(self):
+        base = os.path.abspath(self.project_path_var.get().strip() or app_dir())
+        files = filedialog.askopenfilenames(initialdir=base, title="Selecciona archivos a subir")
+        if not files: return
+        added=[]
+        for f in files:
+            if self._is_under_project(f):
+                added.append(self._normalize_rel(f))
+            else:
+                messagebox.showwarning("Fuera del proyecto", f"Se omitió: {f}")
+        # merge con existentes sin duplicar
+        cur = set(self.cfg.get("selected_files", []))
+        for a in added: cur.add(a)
+        self.cfg["selected_files"] = sorted(cur)
+        safe_write_json(CONFIG_PATH, self.cfg)
+        self._update_selection_counters()
+        self._bump_on_config_change("edit_files")
+        self._status("Archivos seleccionados actualizados.")
 
-    def _browse_ssh_key(self):
-        path = filedialog.askopenfilename(
-            initialdir=os.path.expanduser("~"),
-            title="Selecciona tu clave privada",
-            filetypes=[("Claves", "*"), ("Todos", "*.*")]
-        )
-        if path:
-            self.ssh_key_var.set(path)
-            self._on_str_change("ssh_key_path", self.ssh_key_var.get())
-
-    def _autodetect_repo_name(self):
-        p = self.project_path_var.get().strip() or app_dir()
-        repo = os.path.basename(os.path.normpath(p)) or ""
-        if repo:
-            self.repo_name_var.set(repo); self._on_str_change("repo_name", repo)
-            self._status(f"Repo autodetectado: {repo}")
-
-    def _bump_on_config_change(self, reason=""):
-        old=self.cfg.get("version",INITIAL_VERSION); new=bump_version(old)
-        self.cfg["version"]=new; safe_write_json(CONFIG_PATH,self.cfg)
-        try: self.version_label.config(text=f"Versión: {new}")
-        except: pass
-        log_line(f"Version bump por cambio de config ({reason}): {old} -> {new}")
-
-    # ---------- Log & countdown ----------
-    def _append_log(self, txt):
-        ts = datetime.datetime.now().strftime("%H:%M:%S")
-        self.txt_log.insert("end", f"[{ts}] {txt}\n"); self.txt_log.see("end")
-        log_line(txt)
-
+    # ---------- Autocierre ----------
     def _schedule_autoclose(self):
         self._cancel_autoclose()
-        secs = int(self.cfg.get("autoclose_seconds", 60))
+        try:
+            secs = int(self.cfg.get("autoclose_seconds", 60))
+        except:
+            secs = 60
         if secs < 1: secs = 1
         self.autoclose_remaining = secs
         self.countdown_var.set(f"Auto-cierre: {self.autoclose_remaining} s")
@@ -651,78 +604,110 @@ class App(tk.Tk):
         self.countdown_var.set(f"Auto-cierre: {self.autoclose_remaining} s")
         self.countdown_job = self.after(1000, self._tick_countdown)
 
-    # ---------- Subprocess helpers ----------
+    # ---------- Config handlers ----------
+    def _on_bool_change(self, key, value):
+        self.cfg[key]=bool(value); safe_write_json(CONFIG_PATH,self.cfg); self._bump_on_config_change(f"{key}={value}")
+        self._status(f"Guardado {key} = {value}")
+        if key=="autoclose_enabled":
+            if value and not self.running: self._schedule_autoclose()
+            else: self._cancel_autoclose()
+    def _on_int_change(self, key, raw):
+        try: v = max(1, min(86400, int(str(raw).strip())))
+        except: v = DEFAULT_CONFIG.get(key, 60)
+        self.cfg[key]=v; safe_write_json(CONFIG_PATH,self.cfg); self._bump_on_config_change(f"{key}={v}")
+        self._status(f"Guardado {key} = {v}")
+        if key=="autoclose_seconds" and self.autoclose_var.get() and not self.running:
+            self._schedule_autoclose()
+    def _on_str_change(self, key, value):
+        self.cfg[key]=value; safe_write_json(CONFIG_PATH,self.cfg); self._bump_on_config_change(f"{key}=len{len(str(value))}")
+        self._status(f"Guardado {key}")
+    def _on_project_path_change(self):
+        # mantener comportamiento existente
+        if self.cfg.get("follow_exe_folder", True):
+            self.cfg["project_path"] = app_dir()
+            self.project_path_var.set(self.cfg["project_path"])
+        else:
+            self.cfg["project_path"] = self.project_path_var.get()
+        # NUEVO: validar selección actual contra nueva ruta
+        base = os.path.abspath(self.cfg["project_path"])
+        def _keep_if_exists(rel):
+            p = os.path.join(base, rel)
+            return os.path.exists(p)
+        self.cfg["selected_subfolders"] = [rel for rel in self.cfg.get("selected_subfolders", []) if _keep_if_exists(rel)]
+        self.cfg["selected_files"]      = [rel for rel in self.cfg.get("selected_files", []) if _keep_if_exists(rel)]
+        safe_write_json(CONFIG_PATH, self.cfg)
+        self._update_selection_counters()
+        if not self.repo_name_var.get(): self._autodetect_repo_name()
+    def _browse_folder(self):
+        if self.cfg.get("follow_exe_folder", True):
+            self._status("Bloqueado por 'Usar carpeta del ejecutable'."); return
+        path = filedialog.askdirectory(initialdir=self.project_path_var.get() or app_dir(), title="Selecciona la carpeta del proyecto")
+        if path:
+            self.project_path_var.set(path); self._on_project_path_change()
+    def _browse_ssh_key(self):
+        path = filedialog.askopenfilename(initialdir=os.path.expanduser("~"), title="Selecciona tu clave privada",
+                                          filetypes=[("Claves", "*"), ("Todos", "*.*")])
+        if path:
+            self.ssh_key_var.set(path); self._on_str_change("ssh_key_path", self.ssh_key_var.get())
+    def _autodetect_repo_name(self):
+        p = self.project_path_var.get().strip() or app_dir()
+        repo = os.path.basename(os.path.normpath(p)) or ""
+        if repo:
+            self.repo_name_var.set(repo); self._on_str_change("repo_name", repo)
+            self._status(f"Repo autodetectado: {repo}")
+    def _bump_on_config_change(self, reason=""):
+        old=self.cfg.get("version",INITIAL_VERSION); new=bump_version(old)
+        self.cfg["version"]=new; safe_write_json(CONFIG_PATH,self.cfg)
+        try: self.version_label.config(text=f"Versión: {new}")
+        except: pass
+        log_line(f"Version bump por cambio de config ({reason}): {old} -> {new}")
+
+    # ---------- Log ----------
+    def _append_log(self, txt):
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        self.txt_log.insert("end", f"[{ts}] {txt}\n"); self.txt_log.see("end")
+        log_line(txt)
+
+    # ---------- Subprocess ----------
     def _startupinfo_flags(self):
         si = None; cf = 0
         if os.name == "nt":
-            si = subprocess.STARTUPINFO()
-            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            si.wShowWindow = 0  # SW_HIDE
-            try:
-                cf = subprocess.CREATE_NO_WINDOW
-            except AttributeError:
-                cf = 0
+            si = subprocess.STARTUPINFO(); si.dwFlags |= subprocess.STARTF_USESHOWWINDOW; si.wShowWindow = 0
+            try: cf = subprocess.CREATE_NO_WINDOW
+            except AttributeError: cf = 0
         return si, cf
-
     def _utf8_env_overlay(self):
-        return {"LC_ALL": "C.UTF-8", "LANG": "C.UTF-8", "LESSCHARSET": "utf-8"}
-
+        return {"LC_ALL":"C.UTF-8","LANG":"C.UTF-8","LESSCHARSET":"utf-8"}
     def _git_env(self, project_path):
         env = os.environ.copy()
-        project_path = os.path.abspath(project_path)
-        env["GIT_WORK_TREE"] = project_path
-        env["GIT_DIR"] = os.path.join(project_path, ".git")
-        env["GIT_CEILING_DIRECTORIES"] = os.path.dirname(project_path)
-        env["GIT_PAGER"] = "cat"
-        env["PAGER"] = "cat"
-        env["GH_PAGER"] = "cat"
-        env["GIT_TERMINAL_PROMPT"] = "0"
-        env["GIT_ASKPASS"] = "echo"
-        env["GCM_INTERACTIVE"] = "Never"
-        env["NO_COLOR"] = "1"
-        env.update(self._utf8_env_overlay())
-        return env
-
+        env["GIT_PAGER"]="cat"; env["PAGER"]="cat"; env["GH_PAGER"]="cat"
+        env["GIT_TERMINAL_PROMPT"]="0"; env["GIT_ASKPASS"]="echo"; env["GCM_INTERACTIVE"]="Never"; env["NO_COLOR"]="1"
+        env.update(self._utf8_env_overlay()); return env
     def _ensure_utf8_in_env(self, env):
-        if env is None:
-            env = os.environ.copy()
-        env.update(self._utf8_env_overlay())
-        return env
-
-    # Helpers que NO dependen de self.running
+        if env is None: env=os.environ.copy()
+        env.update(self._utf8_env_overlay()); return env
     def _popen_capture_any(self, args, cwd=None, env=None):
-        si, cf = self._startupinfo_flags()
-        env = self._ensure_utf8_in_env(env)
+        si, cf = self._startupinfo_flags(); env=self._ensure_utf8_in_env(env)
         try:
-            p = subprocess.Popen(
-                args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, encoding="utf-8", errors="replace",
-                startupinfo=si, creationflags=cf, env=env
-            )
-            out, _ = p.communicate()
-            return p.returncode, out
+            p = subprocess.Popen(args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                 text=True, encoding="utf-8", errors="replace",
+                                 startupinfo=si, creationflags=cf, env=env)
+            out,_=p.communicate(); return p.returncode, out
         except FileNotFoundError:
             return 127, f"ERROR: comando no encontrado: {args[0]}"
         except Exception as e:
             return 1, f"ERROR ejecutando {args}: {e}"
-
     def _popen_run_any(self, args, cwd=None, env=None):
         rc, out = self._popen_capture_any(args, cwd, env)
         if out: self.worker_queue.put(("log", out.strip()))
         return rc
-
     def _run_cmd(self, args, cwd, stream=True, env=None):
         si, cf = self._startupinfo_flags()
-        if env is None and args and args[0] == "git" and cwd:
-            env = self._git_env(cwd)
-        else:
-            env = self._ensure_utf8_in_env(env)
+        env = self._git_env(cwd) if (env is None and args and args[0]=="git" and cwd) else self._ensure_utf8_in_env(env)
         try:
-            p = subprocess.Popen(
-                args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, encoding="utf-8", errors="replace",
-                startupinfo=si, creationflags=cf, env=env
-            )
+            p = subprocess.Popen(args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                 text=True, encoding="utf-8", errors="replace",
+                                 startupinfo=si, creationflags=cf, env=env)
             if stream:
                 for line in iter(p.stdout.readline, ""):
                     if line: self.worker_queue.put(("log", line.rstrip("\r\n")))
@@ -735,81 +720,52 @@ class App(tk.Tk):
             self.worker_queue.put(("log", f"ERROR: comando no encontrado: {args[0]}")); return 127
         except Exception as e:
             self.worker_queue.put(("log", f"ERROR ejecutando {args}: {e}")); return 1
-
     def _run_cmd_capture(self, args, cwd, env=None):
         if not self.running: return (1, "")
         si, cf = self._startupinfo_flags()
-        if env is None and args and args[0] == "git" and cwd:
-            env = self._git_env(cwd)
-        else:
-            env = self._ensure_utf8_in_env(env)
+        env = self._git_env(cwd) if (env is None and args and args[0]=="git" and cwd) else self._ensure_utf8_in_env(env)
         try:
-            p = subprocess.Popen(
-                args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, encoding="utf-8", errors="replace",
-                startupinfo=si, creationflags=cf, env=env
-            )
-            out, _ = p.communicate()
+            p = subprocess.Popen(args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                 text=True, encoding="utf-8", errors="replace",
+                                 startupinfo=si, creationflags=cf, env=env)
+            out,_=p.communicate()
             if out: self.worker_queue.put(("log", out.strip()))
             return p.returncode, out
         except Exception as e:
-            txt = f"ERROR ejecutando {args}: {e}"
-            self.worker_queue.put(("log", txt)); return (1, txt)
-
+            txt=f"ERROR ejecutando {args}: {e}"; self.worker_queue.put(("log", txt)); return (1, txt)
     def _run_check_output(self, args, cwd=None, env=None):
         si, cf = self._startupinfo_flags()
-        if env is None and args and args[0] == "git" and cwd:
-            env = self._git_env(cwd)
-        else:
-            env = self._ensure_utf8_in_env(env)
-        return subprocess.check_output(
-            args, cwd=cwd, text=True, encoding="utf-8", errors="replace",
-            stderr=subprocess.DEVNULL, startupinfo=si, creationflags=cf, env=env
-        )
+        env = self._git_env(cwd) if (env is None and args and args[0]=="git" and cwd) else self._ensure_utf8_in_env(env)
+        return subprocess.check_output(args, cwd=cwd, text=True, encoding="utf-8",
+                                       errors="replace", stderr=subprocess.DEVNULL,
+                                       startupinfo=si, creationflags=cf, env=env)
 
     # ---------- Git helpers ----------
     def _is_git_repo(self, path):
         si, cf = self._startupinfo_flags()
         try:
-            rc = subprocess.call(
-                ["git","rev-parse","--is-inside-work-tree"], cwd=path,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                env=self._git_env(path), startupinfo=si, creationflags=cf
-            )
-            return rc == 0
+            rc = subprocess.call(["git","rev-parse","--is-inside-work-tree"], cwd=path,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 env=self._git_env(path), startupinfo=si, creationflags=cf)
+            return rc==0
         except Exception: return False
-
     def _git_toplevel(self, path):
         try: return self._run_check_output(["git","rev-parse","--show-toplevel"], cwd=path).strip()
         except: return ""
-
     def _remote_url(self, path):
         try: return self._run_check_output(["git","remote","get-url","origin"], cwd=path).strip()
         except: return ""
-
     def _build_origin(self, method, github_user, repo):
-        if method == "ssh":
-            return f"git@github.com:{github_user}/{repo}.git"
-        elif method == "https_pat":
-            pat_token = self.pat_token_var.get().strip()
-            if pat_token:
-                return f"https://x-access-token:{pat_token}@github.com/{github_user}/{repo}.git"
-            else:
-                return f"https://github.com/{github_user}/{repo}.git"
-        else:  # gh
-            return f"https://github.com/{github_user}/{repo}.git"
-
+        if method=="ssh": return f"git@github.com:{github_user}/{repo}.git"
+        elif method=="https_pat":
+            pat=(self.pat_token_var.get() or "").strip()
+            return f"https://x-access-token:{pat}@github.com/{github_user}/{repo}.git" if pat else f"https://github.com/{github_user}/{repo}.git"
+        else: return f"https://github.com/{github_user}/{repo}.git"
     def _ensure_origin(self, path, url):
         current = self._remote_url(path)
-        if not current:
-            self.worker_queue.put(("log", f"Agregando origin -> {url}"))
-            self._run_cmd(["git","remote","add","origin", url], cwd=path)
-        elif current.lower()!=url.lower():
-            self.worker_queue.put(("log", f"Actualizando origin: {current} -> {url}"))
-            self._run_cmd(["git","remote","set-url","origin", url], cwd=path)
-        else:
-            self.worker_queue.put(("log", f"Origin ya configurado: {current}"))
-
+        if not current: self._run_cmd(["git","remote","add","origin", url], cwd=path)
+        elif current.lower()!=url.lower(): self._run_cmd(["git","remote","set-url","origin", url], cwd=path)
+        else: self.worker_queue.put(("log", f"Origin ya configurado: {current}"))
     def _exe_exists(self, name):
         for p in os.environ.get("PATH","").split(os.pathsep):
             full=os.path.join(p, name + (".exe" if os.name=="nt" else ""))
@@ -818,31 +774,27 @@ class App(tk.Tk):
 
     def _remote_exists(self, user, repo):
         if not self._exe_exists("gh"): return False
-        si, cf = self._startupinfo_flags()
-        env = self._ensure_utf8_in_env(None)
+        si, cf = self._startupinfo_flags(); env=self._ensure_utf8_in_env(None)
         try:
-            subprocess.check_output(["gh","repo","view", f"{user}/{repo}"],
-                                    text=True, encoding="utf-8", errors="replace",
-                                    stderr=subprocess.DEVNULL, startupinfo=si, creationflags=cf, env=env)
+            subprocess.check_output(["gh","repo","view", f"{user}/{repo}"], text=True, encoding="utf-8",
+                                    errors="replace", stderr=subprocess.DEVNULL,
+                                    startupinfo=si, creationflags=cf, env=env)
             return True
         except subprocess.CalledProcessError: return False
         except Exception: return False
-
     def _gh_auth_status_ok(self):
         if not self._exe_exists("gh"): return False
-        si, cf = self._startupinfo_flags()
-        env = self._ensure_utf8_in_env(None)
+        si, cf = self._startupinfo_flags(); env=self._ensure_utf8_in_env(None)
         try:
-            subprocess.check_output(["gh","auth","status"], text=True, encoding="utf-8", errors="replace",
-                                    stderr=subprocess.DEVNULL, startupinfo=si, creationflags=cf, env=env)
+            subprocess.check_output(["gh","auth","status"], text=True, encoding="utf-8",
+                                    errors="replace", stderr=subprocess.DEVNULL,
+                                    startupinfo=si, creationflags=cf, env=env)
             return True
         except Exception: return False
-
     def _gh_login_with_token(self, token):
         if not self._exe_exists("gh"): return False
         if self._gh_auth_status_ok(): return True
-        si, cf = self._startupinfo_flags()
-        env = self._ensure_utf8_in_env(None)
+        si, cf = self._startupinfo_flags(); env=self._ensure_utf8_in_env(None)
         try:
             p = subprocess.Popen(["gh","auth","login","--with-token"],
                                  text=True, encoding="utf-8", errors="replace",
@@ -853,92 +805,62 @@ class App(tk.Tk):
         except Exception as e:
             self.worker_queue.put(("log", f"ERROR gh auth login: {e}")); return False
 
-    # ====== Limpieza de credenciales/ayudantes ======
     def _clear_cached_github_creds(self):
         self.worker_queue.put(("log", "Limpiando credenciales cacheadas de GitHub…"))
-        si, cf = self._startupinfo_flags()
-        env = self._ensure_utf8_in_env(None)
+        si, cf = self._startupinfo_flags(); env=self._ensure_utf8_in_env(None)
         try:
-            p = subprocess.Popen(["git", "credential", "reject"],
-                                 text=True, encoding="utf-8", errors="replace",
+            p = subprocess.Popen(["git", "credential", "reject"], text=True, encoding="utf-8", errors="replace",
                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                  startupinfo=si, creationflags=cf, env=env)
             p.communicate(input="protocol=https\nhost=github.com\n\n", timeout=10)
         except Exception: pass
         for cmd in (["git", "credential-manager", "erase"], ["git-credential-manager", "erase"]):
             try:
-                p = subprocess.Popen(cmd,
-                                     text=True, encoding="utf-8", errors="replace",
+                p = subprocess.Popen(cmd, text=True, encoding="utf-8", errors="replace",
                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                      startupinfo=si, creationflags=cf, env=env)
                 p.communicate(input="protocol=https\nhost=github.com\n\n", timeout=10)
             except Exception: pass
-
     def _nuke_credential_helpers(self, project_path):
-        """Elimina helpers de credenciales (local y global) que puedan interferir."""
         self.worker_queue.put(("log", "Deshabilitando credential.helper (local y global)…"))
-        # Local
         self._run_cmd(["git", "config", "--unset-all", "credential.helper"], cwd=project_path)
         self._run_cmd(["git", "config", "credential.helper", ""], cwd=project_path)
-        # Global
         try:
             self._run_cmd(["git", "config", "--global", "--unset-all", "credential.helper"], cwd=None)
             self._run_cmd(["git", "config", "--global", "credential.helper", ""], cwd=None)
-        except Exception:
-            pass
+        except Exception: pass
         self._clear_cached_github_creds()
-
-    # ====== Fijar origin con PAT embebido (x-access-token) ======
     def _reset_origin_with_pat(self, project_path):
-        method = self.auth_method_var.get().strip() or "https_pat"
-        if method != "https_pat":
-            self.worker_queue.put(("log", "Método no es https_pat; no se modifica origin con PAT."))
-            return
-        github_user = self.github_user_var.get().strip()
-        repo_name   = self.repo_name_var.get().strip()
-        pat_token   = self.pat_token_var.get().strip()
-        if not (github_user and repo_name and pat_token):
-            self.worker_queue.put(("log", "No se puede fijar origin con PAT (faltan datos: user/repo/token)."))
-            return
-        url_pat = f"https://x-access-token:{pat_token}@github.com/{github_user}/{repo_name}.git"
-        masked = pat_token[:4] + "…" + pat_token[-4:] if len(pat_token) >= 8 else "****"
+        github_user=(self.github_user_var.get() or "").strip()
+        repo_name=(self.repo_name_var.get() or "").strip()
+        pat=(self.pat_token_var.get() or "").strip()
+        if not (github_user and repo_name and pat):
+            self.worker_queue.put(("log", "No se puede fijar origin con PAT (faltan user/repo/token).")); return
+        url=f"https://x-access-token:{pat}@github.com/{github_user}/{repo_name}.git"
+        masked = pat[:4]+"…"+pat[-4:] if len(pat)>=8 else "****"
         self.worker_queue.put(("log", f"Forzando origin con PAT: https://x-access-token:{masked}@github.com/{github_user}/{repo_name}.git"))
-        rc = self._run_cmd(["git", "remote", "set-url", "origin", url_pat], cwd=project_path)
-        if rc != 0:
-            self._run_cmd(["git", "remote", "add", "origin", url_pat], cwd=project_path)
-        try:
-            current = self._remote_url(project_path)
-            self.worker_queue.put(("log", f"Remote actual: {current}"))
-        except Exception:
-            pass
+        rc = self._run_cmd(["git","remote","set-url","origin", url], cwd=project_path)
+        if rc!=0: self._run_cmd(["git","remote","add","origin", url], cwd=project_path)
+        try: self.worker_queue.put(("log", f"Remote actual: {self._remote_url(project_path)}"))
+        except Exception: pass
 
-    # ====== Crear repo remoto ======
     def _create_remote(self, owner_repo, project_path):
         if not self._exe_exists("gh"):
-            self.worker_queue.put(("log", "GitHub CLI no disponible, no se puede crear repo remoto"))
-            return False
+            self.worker_queue.put(("log", "GitHub CLI no disponible, no se puede crear repo remoto")); return False
         if not self._gh_auth_status_ok():
-            pat_token = self.pat_token_var.get().strip()
-            if pat_token:
+            pat=(self.pat_token_var.get() or "").strip()
+            if pat:
                 self.worker_queue.put(("log", "Autenticando GitHub CLI con token…"))
-                if not self._gh_login_with_token(pat_token):
-                    self.worker_queue.put(("log", "❌ No se pudo autenticar GitHub CLI"))
-                    return False
+                if not self._gh_login_with_token(pat):
+                    self.worker_queue.put(("log", "❌ No se pudo autenticar GitHub CLI")); return False
             else:
-                self.worker_queue.put(("log", "❌ No hay PAT token para autenticar GitHub CLI"))
-                return False
+                self.worker_queue.put(("log", "❌ No hay PAT token para autenticar GitHub CLI")); return False
         self.worker_queue.put(("log", f"Creando repo remoto: {owner_repo} (public)…"))
         rc = self._run_cmd(["gh", "repo", "create", owner_repo, "--public", "--confirm"], cwd=project_path)
-        if rc == 0:
-            # Siempre fuerza origin con PAT tras crear el repo con gh
-            self._reset_origin_with_pat(project_path)
-            return True
+        if rc == 0: self._reset_origin_with_pat(project_path); return True
         return False
 
-    def _save_pat_in_credential_manager(self, user, token):
-        self.worker_queue.put(("log", "PAT no se persiste automáticamente (stub)."))
-
-    # --- .gitignore / untrack / tamaño ---
+    # ---------- .gitignore / tmp / grandes ----------
     def _ensure_gitignore(self, project_path):
         path = os.path.join(project_path, ".gitignore"); existing = []
         if os.path.exists(path):
@@ -948,7 +870,7 @@ class App(tk.Tk):
             except: existing=[]
         merged = existing[:]; changed = False
         for ln in GITIGNORE_LINES:
-            if ln not in merged: merged.append(ln); changed = True
+            if ln not in merged: merged.append(ln); changed=True
         if changed:
             try:
                 with open(path, "w", encoding="utf-8") as f:
@@ -956,81 +878,57 @@ class App(tk.Tk):
                 self.worker_queue.put(("log", "Actualizado .gitignore"))
             except Exception as e:
                 self.worker_queue.put(("log", f"ERROR escribiendo .gitignore: {e}"))
-
     def _append_gitignore_patterns(self, project_path, relpaths):
         if not relpaths: return
-        path = os.path.join(project_path, ".gitignore")
-        current = set()
+        path = os.path.join(project_path, ".gitignore"); current=set()
         if os.path.exists(path):
             try:
-                with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                    current = set([ln.strip() for ln in f.read().splitlines() if ln.strip()])
-            except:
-                current = set()
-        norm_relpaths = []
+                with open(path,"r",encoding="utf-8",errors="ignore") as f:
+                    current=set([ln.strip() for ln in f.read().splitlines() if ln.strip()])
+            except: current=set()
+        to_add=[]
         for rel in relpaths:
-            rel = rel.replace("\\", "/")
-            if rel and rel not in current:
-                norm_relpaths.append(rel)
-        if not norm_relpaths: return
+            rel=rel.replace("\\","/")
+            if rel and rel not in current: to_add.append(rel)
+        if not to_add: return
         try:
-            with open(path, "a", encoding="utf-8") as f:
-                for rel in norm_relpaths:
-                    f.write(rel + "\n")
+            with open(path,"a",encoding="utf-8") as f:
+                for rel in to_add: f.write(rel+"\n")
         except Exception as e:
             self.worker_queue.put(("log", f"ERROR escribiendo .gitignore: {e}"))
-
     def _is_tracked(self, project_path, relpath):
         try:
             out = self._run_check_output(["git","ls-files","--error-unmatch", relpath], cwd=project_path)
             return bool(out.strip())
         except subprocess.CalledProcessError: return False
         except Exception: return False
-
     def _untrack_list(self, project_path, relpaths):
-        removed = []
+        removed=[]
         for rel in relpaths:
-            full = os.path.join(project_path, rel)
-            if not os.path.exists(full):
-                continue
-            if not self._is_tracked(project_path, rel):
-                continue
-            rc = self._run_cmd(["git","rm","--cached","-f", rel], cwd=project_path)
-            if rc == 0: removed.append(rel)
-        if removed: self.worker_queue.put(("log", "Untrack: " + ", ".join(removed)))
+            full=os.path.join(project_path, rel)
+            if not os.path.exists(full) and not self._is_tracked(project_path, rel): continue
+            if self._is_tracked(project_path, rel):
+                rc=self._run_cmd(["git","rm","--cached","-f", rel], cwd=project_path)
+                if rc==0: removed.append(rel)
+        if removed: self.worker_queue.put(("log","Untrack: "+", ".join(removed)))
         return removed
-
-    def _bytes_limit_from_cfg(self):
-        try: return int(self.cfg.get("max_file_size_mb", 95)) * 1024 * 1024
-        except: return 95 * 1024 * 1024
-
     def _scan_large_files(self, project_path):
-        limit = self._bytes_limit_from_cfg(); big=[]
+        limit = int(self.cfg.get("max_file_size_mb",95))*1024*1024; big=[]
         for root, dirs, files in os.walk(project_path):
             if ".git" in dirs: dirs.remove(".git")
             for name in files:
-                p = os.path.join(root, name)
+                p=os.path.join(root,name)
                 try:
-                    if os.path.getsize(p) > limit:
-                        rel = os.path.relpath(p, project_path); big.append(rel)
+                    if os.path.getsize(p)>limit:
+                        rel=os.path.relpath(p, project_path); big.append(rel.replace("\\","/"))
                 except: pass
-        special = "autogit.exe"; sp = os.path.join(project_path, special)
+        sp=os.path.join(project_path,"autogit.exe")
         if os.path.exists(sp):
-            rel = os.path.relpath(sp, project_path)
+            rel=os.path.relpath(sp, project_path).replace("\\","/")
             if rel not in big: big.append(rel)
         return big
 
-    # --- Limpieza de HISTORIA (filter-repo / filter-branch) ---
-    def _run_filter_repo(self, project_path, paths):
-        try:
-            args = ["git","filter-repo","--force"]
-            for p in paths:
-                args += ["--invert-paths","--path", p]
-            rc = self._run_cmd(args, cwd=project_path)
-            return rc == 0
-        except Exception:
-            return False
-
+    # ---------- Historia ----------
     def _worktree_dirty(self, cwd):
         try:
             si, cf = self._startupinfo_flags()
@@ -1045,19 +943,16 @@ class App(tk.Tk):
             return (rc1 != 0) or (rc2 != 0) or has_untracked
         except Exception:
             return True
-
     def _prepare_history_rewrite(self, cwd):
         if self._worktree_dirty(cwd):
             self.worker_queue.put(("log","Working tree sucio: guardando en stash…"))
             rc = self._run_cmd(["git","stash","push","-u","-m","autogit-temp-stash"], cwd=cwd)
             return rc == 0
         return False
-
     def _restore_after_rewrite(self, cwd, stashed):
         if stashed:
             self.worker_queue.put(("log","Restaurando cambios desde stash…"))
             self._run_cmd(["git","stash","pop"], cwd=cwd)
-
     def _find_paths_in_history(self, project_path, name_patterns):
         rc, out = self._run_cmd_capture(["git","rev-list","--objects","--all"], project_path)
         if rc != 0 or not out: return []
@@ -1077,472 +972,365 @@ class App(tk.Tk):
                     if base == pat:
                         result.add(rel)
         return sorted(result)
-
+    def _run_filter_repo(self, project_path, paths):
+        try:
+            args=["git","filter-repo","--force"]
+            for p in paths: args+=["--invert-paths","--path", p]
+            rc=self._run_cmd(args, cwd=project_path)
+            return rc==0
+        except Exception: return False
     def _run_filter_branch(self, project_path, paths):
         if not paths: return True
-        stashed = self._prepare_history_rewrite(project_path)
-        env = self._git_env(project_path)
-        env["FILTER_BRANCH_SQUELCH_WARNING"] = "1"
-        rm_parts = [f"git rm -q -f --cached --ignore-unmatch {p}" for p in paths]
-        rm_cmd = " && ".join(rm_parts) or "echo noop"
-        rc = self._run_cmd(
-            ["git","filter-branch","-f","--prune-empty","--tag-name-filter","cat",
-             "--index-filter", rm_cmd, "--","--all"],
-            cwd=project_path, env=env
-        )
-        if rc != 0:
-            self._restore_after_rewrite(project_path, stashed)
-            return False
+        stashed=self._prepare_history_rewrite(project_path)
+        env=self._git_env(project_path); env["FILTER_BRANCH_SQUELCH_WARNING"]="1"
+        rm_cmd = " && ".join([f"git rm -q -f --cached --ignore-unmatch {p}" for p in paths]) or "echo noop"
+        rc=self._run_cmd(["git","filter-branch","-f","--prune-empty","--tag-name-filter","cat",
+                          "--index-filter", rm_cmd, "--","--all"], cwd=project_path, env=env)
+        if rc!=0:
+            self._restore_after_rewrite(project_path, stashed); return False
         self._run_cmd(["git","for-each-ref","--format=%(refname)","refs/original/"], cwd=project_path, env=env)
         self._run_cmd(["git","update-ref","-d","refs/original/refs/heads/main"], cwd=project_path, env=env)
         self._run_cmd(["git","reflog","expire","--expire=now","--all"], cwd=project_path, env=env)
         self._run_cmd(["git","gc","--prune=now","--aggressive"], cwd=project_path, env=env)
-        self._restore_after_rewrite(project_path, stashed)
-        return True
-
+        self._restore_after_rewrite(project_path, stashed); return True
     def _purge_history_paths(self, project_path, patterns):
         if not patterns: return True
         names, routes = [], []
         for p in patterns:
             if ("/" in p) or ("\\" in p): routes.append(p.replace("\\","/"))
             else: names.append(p)
-        to_purge = []
-        if names:
-            hist_routes = self._find_paths_in_history(project_path, names)
-            to_purge.extend(hist_routes)
+        to_purge=[]
+        if names: to_purge.extend(self._find_paths_in_history(project_path, names))
         to_purge.extend(routes)
-        expanded, seen = [], set()
+        expanded=[]; seen=set()
         for r in to_purge:
-            if r not in seen:
-                seen.add(r); expanded.append(r)
+            if r not in seen: seen.add(r); expanded.append(r)
         if not expanded:
-            self.worker_queue.put(("log", "No se encontraron rutas históricas a purgar."))
-            return True
-        self.worker_queue.put(("log", "Rutas a purgar del historial: " + ", ".join(expanded)))
-        ok = self._run_filter_repo(project_path, expanded)
+            self.worker_queue.put(("log","No se encontraron rutas históricas a purgar.")); return True
+        self.worker_queue.put(("log","Rutas a purgar del historial: "+", ".join(expanded)))
+        ok=self._run_filter_repo(project_path, expanded)
         if not ok:
-            self.worker_queue.put(("log", "filter-repo no disponible/falló; usando filter-branch…"))
-            ok = self._run_filter_branch(project_path, expanded)
-        if ok:
-            self.worker_queue.put(("log", "Limpieza de historia completada."))
-        else:
-            self.worker_queue.put(("log", "ERROR: no se pudo limpiar la historia."))
+            self.worker_queue.put(("log","filter-repo no disponible/falló; usando filter-branch…"))
+            ok=self._run_filter_branch(project_path, expanded)
+        if ok: self.worker_queue.put(("log","Limpieza de historia completada."))
+        else:  self.worker_queue.put(("log","ERROR: no se pudo limpiar la historia."))
         return ok
 
-    # --- Auto-sync con remoto cuando push es rechazado ---
+    # ---------- Sync remoto ----------
     def _sync_with_remote(self, project_path):
-        self.worker_queue.put(("log", "Intentando sincronizar con remoto (fetch/pull)…"))
+        self.worker_queue.put(("log","Intentando sincronizar con remoto (fetch/pull)…"))
         self._run_cmd(["git","fetch","origin","main"], cwd=project_path)
         self._run_cmd(["git","branch","--set-upstream-to=origin/main","main"], cwd=project_path)
-        rc = self._run_cmd(["git","pull","--rebase","--autostash","origin","main"], cwd=project_path)
-        if rc == 0:
-            self.worker_queue.put(("log", "pull --rebase exitoso."))
-            return True
+        rc=self._run_cmd(["git","pull","--rebase","--autostash","origin","main"], cwd=project_path)
+        if rc==0: self.worker_queue.put(("log","pull --rebase exitoso.")); return True
         self._run_cmd(["git","rebase","--abort"], cwd=project_path)
-        rc = self._run_cmd(["git","pull","origin","main","--allow-unrelated-histories","--no-edit"], cwd=project_path)
-        if rc == 0:
-            self.worker_queue.put(("log", "pull con --allow-unrelated-histories exitoso."))
-            return True
+        rc=self._run_cmd(["git","pull","origin","main","--allow-unrelated-histories","--no-edit"], cwd=project_path)
+        if rc==0: self.worker_queue.put(("log","pull con --allow-unrelated-histories exitoso.")); return True
         self._run_cmd(["git","merge","--abort"], cwd=project_path)
-        rc = self._run_cmd(["git","pull","-s","recursive","-X","ours","origin","main",
-                            "--allow-unrelated-histories","--no-edit"], cwd=project_path)
-        if rc == 0:
-            self.worker_queue.put(("log", "pull -X ours exitoso (se conserva local)."))
-            return True
+        rc=self._run_cmd(["git","pull","-s","recursive","-X","ours","origin","main",
+                          "--allow-unrelated-histories","--no-edit"], cwd=project_path)
+        if rc==0: self.worker_queue.put(("log","pull -X ours exitoso (se conserva local).")); return True
         self._run_cmd(["git","merge","--abort"], cwd=project_path)
         self._run_cmd(["git","rebase","--abort"], cwd=project_path)
-        self.worker_queue.put(("log", "No se pudo sincronizar automáticamente con el remoto."))
+        self.worker_queue.put(("log","No se pudo sincronizar automáticamente con el remoto."))
         return False
 
-    # --- Configuración de credenciales para HTTPS ---
-    def _setup_credentials(self, project_path, method):
-        if method == "https_pat":
-            pat_token = self.pat_token_var.get().strip()
-            if not pat_token:
-                self.worker_queue.put(("log", "❌ ERROR: No hay PAT token configurado"))
-                self.worker_queue.put(("log", "💡 Ve a GitHub Settings > Tokens y crea un PAT token"))
-                return False
-            if not self._test_pat_token_quick():
-                self.worker_queue.put(("log", "❌ El PAT token no es válido (API /user)"))
-                return False
-            # Deshabilita helpers y limpia cache, fuerza origin con PAT
-            self._nuke_credential_helpers(project_path)
-            self._reset_origin_with_pat(project_path)
-            self.worker_queue.put(("log", "✅ Credenciales configuradas con PAT (URL embebida x-access-token)"))
-            return True
-        elif method == "gh":
-            if not self._gh_auth_status_ok():
-                pat_token = self.pat_token_var.get().strip()
-                if pat_token:
-                    self.worker_queue.put(("log", "Autenticando GitHub CLI con token…"))
-                    if self._gh_login_with_token(pat_token):
-                        self.worker_queue.put(("log", "✅ GitHub CLI autenticado"))
-                    else:
-                        self.worker_queue.put(("log", "❌ No se pudo autenticar GitHub CLI")); return False
-                else:
-                    self.worker_queue.put(("log", "❌ No hay PAT token para autenticar GitHub CLI")); return False
-            return True
-        elif method == "ssh":
-            self.worker_queue.put(("log", "✅ Usando autenticación SSH"))
-            return True
-        return True
-
+    # ---------- PAT quick test ----------
     def _test_pat_token_quick(self):
-        pat_token = self.pat_token_var.get().strip()
-        if not pat_token: return False
+        pat=(self.pat_token_var.get() or "").strip()
+        if not pat: return False
         import urllib.request, urllib.error
         try:
-            url = "https://api.github.com/user"
-            headers = {'Authorization': f'token {pat_token}','User-Agent': 'AutoGit-App','Accept': 'application/vnd.github.v3+json'}
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=5) as response:
-                return response.code == 200
-        except Exception:
-            return False
+            req=urllib.request.Request("https://api.github.com/user",
+                        headers={'Authorization': f'token {pat}','User-Agent':'AutoGit-App','Accept':'application/vnd.github.v3+json'})
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.code==200
+        except Exception: return False
 
-    # --- Asegurar re-init limpio si es la primera vez ---
+    # ---------- Init limpio ----------
     def _ensure_clean_git_repo(self, project_path):
-        """Si es primer push, borra .git si existe y re-inicializa limpio."""
-        git_dir = os.path.join(project_path, ".git")
-        is_repo = self._is_git_repo(project_path)
-        clean_first = self.cfg.get("clean_git_on_first_time", True)
-        first_time = not is_repo
+        git_dir=os.path.join(project_path,".git")
+        is_repo=self._is_git_repo(project_path)
+        clean_first=self.cfg.get("clean_git_on_first_time", True)
+        first_time=not is_repo
         if first_time and os.path.isdir(git_dir) and clean_first:
-            self.worker_queue.put(("log", "🧹 Detectada carpeta .git existente en primer uso; eliminando para re-init limpio…"))
+            self.worker_queue.put(("log","🧹 Detectada carpeta .git en primer uso; eliminando para re-init limpio…"))
             if not safe_rmtree(git_dir):
-                self.worker_queue.put(("log", "❌ No se pudo borrar .git. Cierra apps que bloqueen archivos e inténtalo de nuevo."))
+                self.worker_queue.put(("log","❌ No se pudo borrar .git. Cierra apps que bloqueen archivos e inténtalo de nuevo."))
                 return False
         if first_time:
             self.worker_queue.put(("log","🆕 Inicializando repositorio Git (clean)…"))
-            if self._run_cmd(["git","init"], cwd=project_path) != 0:
+            if self._run_cmd(["git","init"], cwd=project_path)!=0:
                 self.worker_queue.put(("log","ERROR en git init")); return False
         return True
 
-    # --- NUEVO: helpers de staging según selección ---
-    def _expand_dir_pattern(self, rel):
-        r = rel.replace("\\","/").strip().strip("/")
-        if not r: return []
-        return [r, f"{r}/**"]
+    # ---------- Push ----------
+    def _push_explicit_main(self, project_path):
+        rc, out = self._run_cmd_capture(["git","push","-u","origin","HEAD:refs/heads/main"], project_path)
+        return rc
+    def _force_push_explicit_main(self, project_path):
+        rc, out = self._run_cmd_capture(["git","push","--force","origin","HEAD:refs/heads/main"], project_path)
+        return rc
 
-    def _stage_include_only(self, project_path, includes):
-        """
-        Staging solo de las rutas indicadas. Si 'includes' está vacío, equivale a 'git add .'
-        """
-        if not includes:
-            return self._run_cmd(["git","add","."], cwd=project_path) == 0
-
-        # Limpia staging por seguridad
-        self._run_cmd(["git","reset"], cwd=project_path)
-
-        ok = True
-        for rel in includes:
-            full = os.path.join(project_path, rel)
-            if os.path.isdir(full):
-                rc = self._run_cmd(["git","add", rel], cwd=project_path)
-            else:
-                rc = self._run_cmd(["git","add", rel], cwd=project_path)
-            ok = ok and (rc == 0)
-        return ok
-
-    def _apply_excludes(self, project_path, excludes, also_gitignore=True):
-        """
-        Quita del índice lo excluido y opcionalmente lo añade al .gitignore
-        """
-        if not excludes: return True
-        removed = []
-        for rel in excludes:
-            full = os.path.join(project_path, rel)
-            if os.path.isdir(full):
-                rc = self._run_cmd(["git","rm","-r","--cached","--ignore-unmatch", rel], cwd=project_path)
-            else:
-                rc = self._run_cmd(["git","rm","--cached","--ignore-unmatch", rel], cwd=project_path)
-            if rc == 0:
-                removed.append(rel)
-        if removed: self.worker_queue.put(("log", "Untrack (excluir): " + ", ".join(removed)))
-
-        if also_gitignore:
-            patterns = []
-            for rel in excludes:
-                full = os.path.join(project_path, rel)
-                if os.path.isdir(full):
-                    patterns.extend(self._expand_dir_pattern(rel))
-                else:
-                    patterns.append(rel.replace("\\","/"))
-            self._append_gitignore_patterns(project_path, patterns)
-
-        return True
-
-    # --- Push con reintentos + GH001 + non-fast-forward ---
     def _git_push_with_retries(self, project_path, origin="origin", branch="main"):
-        attempts = 3
-        method = self.auth_method_var.get().strip() or "https_pat"
-        if method == "https_pat":
-            pat_token = self.pat_token_var.get().strip()
-            if not pat_token:
-                self.worker_queue.put(("log", "❌ ERROR: No hay PAT token configurado"))
-                self.worker_queue.put(("log", "💡 Usa Ctrl+T para testear el token"))
-                return 1
-        if not self._setup_credentials(project_path, method):
-            return 1
-        if method == "https_pat":
+        attempts=3
+        method=(self.auth_method_var.get().strip() or "https_pat")
+        pat=(self.pat_token_var.get() or "").strip()
+
+        if pat:
             self._nuke_credential_helpers(project_path)
             self._reset_origin_with_pat(project_path)
 
-        for i in range(1, attempts + 1):
-            # Diagnóstico: ver URL actual del remote
-            try:
-                cur = self._remote_url(project_path)
-                self.worker_queue.put(("log", f"DEBUG push -> remote get-url origin: {cur}"))
-            except Exception:
-                pass
+        if method=="https_pat":
+            if not pat:
+                self.worker_queue.put(("log","❌ ERROR: No hay PAT token configurado")); return 1
+            if not self._test_pat_token_quick():
+                self.worker_queue.put(("log","❌ El PAT token no es válido (API /user)")); return 1
 
-            rc, out = self._run_cmd_capture(["git", "push", "-u", origin, branch], project_path)
-            if rc == 0:
-                self.worker_queue.put(("log", "✅ Push exitoso"))
+        for i in range(1, attempts+1):
+            try: cur=self._remote_url(project_path)
+            except Exception: cur=""
+            self.worker_queue.put(("log", f"DEBUG push -> remote get-url origin: {cur}"))
+
+            rc = self._push_explicit_main(project_path)
+            if rc==0:
+                self.worker_queue.put(("log","✅ Push exitoso"))
                 return 0
-            text = (out or "").lower()
+
             self.worker_queue.put(("log", f"push intento {i}/{attempts} falló (rc={rc})"))
 
-            if any(s in text for s in ["fetch first", "non-fast-forward", "updates were rejected", "failed to push some refs"]):
-                self.worker_queue.put(("log", "🔄 Intentando sincronizar con remoto…"))
-                if self._sync_with_remote(project_path):
-                    rc2, _ = self._run_cmd_capture(["git", "push", "-u", origin, branch], project_path)
-                    if rc2 == 0:
-                        self.worker_queue.put(("log", "✅ Push exitoso después de sincronizar"))
+            rc2, out2 = self._run_cmd_capture(["git","push","-u","origin","HEAD:refs/heads/main"], project_path)
+            txt=(out2 or "").lower()
+            if ("gh013" in txt) or ("repository rule violations" in txt) or ("push protection" in txt):
+                self.worker_queue.put(("log","🛡️ Push Protection: purgando secretos del historial…"))
+                purge_patterns = [
+                    "autogit.exe", "autogit*.exe",
+                    "config_autogit.json", "config_autogit.json.tmp",
+                    "*.tmp", ".cfg_*.tmp"
+                ]
+                if not self._purge_history_paths(project_path, purge_patterns):
+                    return rc2 if rc2!=0 else rc
+                if self.cfg.get("force_push_after_purge", True):
+                    rc3 = self._force_push_explicit_main(project_path)
+                    if rc3==0:
+                        self.worker_queue.put(("log","✅ Push forzado exitoso después de purgar secretos"))
                         return 0
                     else:
-                        self.worker_queue.put(("log", "❌ Push aún rechazado tras sincronizar"))
-
-            if any(s in text for s in ["large files detected", "exceeds github's file size limit", "lfs", "gh001"]):
-                self.worker_queue.put(("log", "📦 Detectados archivos grandes, limpiando…"))
-                large_now = self._scan_large_files(project_path)
-                if large_now:
-                    self._append_gitignore_patterns(project_path, large_now)
-                    self._untrack_list(project_path, large_now)
-                    self._run_cmd(["git", "add", ".gitignore"], cwd=project_path)
-                    self._run_cmd(["git", "commit", "--amend", "-C", "HEAD"], cwd=project_path)
-                purge_patterns = list(set(self.cfg.get("history_purge_patterns", ["autogit.exe"]) + large_now))
-                if not self._purge_history_paths(project_path, purge_patterns):
-                    return rc
-                if self.cfg.get("force_push_after_purge", True):
-                    self._run_cmd(["git", "push", "--force", "--prune", origin, "+refs/heads/*:refs/heads/*"], cwd=project_path)
-                    self._run_cmd(["git", "push", "--force", "--prune", origin, "+refs/tags/*:refs/tags/*"], cwd=project_path)
-                    self.worker_queue.put(("log", "✅ Push forzado exitoso después de limpieza"))
-                    return 0
+                        self.worker_queue.put(("log","❌ Push forzado aún rechazado tras purga"))
+                        return rc3
                 else:
-                    continue
+                    return rc2 if rc2!=0 else rc
 
-            if "push protection" in text or "repository rule violations" in text or "cannot contain secrets" in text:
-                self.worker_queue.put(("log", "🛡️ Push Protection: purgando secretos del historial…"))
-                # Intento directo: purgar 'config_autogit.json.tmp' y *.tmp por si se colaron
-                self._purge_history_paths(project_path, ["config_autogit.json.tmp", "*.tmp"])
-                # Y forzar push una vez saneado
-                self._run_cmd(["git", "push", "--force", origin, "main"], cwd=project_path)
-                # continuamos para que suba el resto
-                continue
+            if rc!=0 and i==1:
+                self.worker_queue.put(("log","🔄 Intentando sincronizar con remoto…"))
+                if self._sync_with_remote(project_path):
+                    rc4 = self._push_explicit_main(project_path)
+                    if rc4==0:
+                        self.worker_queue.put(("log","✅ Push exitoso después de sincronizar"))
+                        return 0
 
-            if any(s in text for s in ["http 408", "timeout", "timed out", "the remote end hung up unexpectedly",
-                                        "unexpected disconnect", "operation timed out", "curl 22", "rpc failed"]):
-                self.worker_queue.put(("log", "⏰ Timeout detectado, reconfigurando HTTP…"))
-                self._run_cmd(["git", "config", "http.version", "HTTP/1.1"], cwd=project_path)
-                self._run_cmd(["git", "config", "http.postBuffer", "524288000"], cwd=project_path)
-                self._run_cmd(["git", "config", "http.lowSpeedLimit", "0"], cwd=project_path)
-                self._run_cmd(["git", "config", "http.lowSpeedTime", "0"], cwd=project_path)
-                self._run_cmd(["git", "repack", "-ad", "-f", "--depth=1", "--window=1"], cwd=project_path)
-                self._run_cmd(["git", "gc", "--prune=now"], cwd=project_path)
-                time.sleep(2 * i)
-                continue
+            self.worker_queue.put(("log","⏰ Ajustando parámetros HTTP por si fue timeout…"))
+            self._run_cmd(["git","config","http.version","HTTP/1.1"], cwd=project_path)
+            self._run_cmd(["git","config","http.postBuffer","524288000"], cwd=project_path)
+            self._run_cmd(["git","config","http.lowSpeedLimit","0"], cwd=project_path)
+            self._run_cmd(["git","config","http.lowSpeedTime","0"], cwd=project_path)
+            self._run_cmd(["git","repack","-ad","-f","--depth=1","--window=1"], cwd=project_path)
+            self._run_cmd(["git","gc","--prune=now"], cwd=project_path)
+            time.sleep(1*i)
 
-            if any(s in text for s in ["authentication failed", "could not read username", "terminal prompts disabled", "invalid username or token"]):
-                self.worker_queue.put(("log", "🔐 Error de autenticación detectado"))
-                if method == "https_pat":
-                    self.worker_queue.put(("log", "❌ PAT inválido o permisos insuficientes"))
-                    self.worker_queue.put(("log", "💡 Usa Ctrl+T para verificar el token"))
-                self._setup_credentials(project_path, method)
-            break
+        self.worker_queue.put(("log","❌ Todos los intentos de push fallaron"))
+        return 1
 
-        self.worker_queue.put(("log", f"❌ Todos los intentos de push fallaron"))
-        return rc
-
-    # ---------- Locks ----------
+    # ---------- Pequeños util ----------
     def _remove_index_lock_if_any(self, path):
-        top = self._git_toplevel(path)
+        top=self._git_toplevel(path)
         if not top: return False
-        lock = os.path.join(top, ".git", "index.lock")
+        lock=os.path.join(top,".git","index.lock")
         if os.path.exists(lock):
-            try:
-                os.remove(lock); self.worker_queue.put(("log", f"Se removió lock: {lock}"))
-                return True
-            except Exception as e:
-                self.worker_queue.put(("log", f"ERROR eliminando lock {lock}: {e}"))
+            try: os.remove(lock); self.worker_queue.put(("log", f"Se removió lock: {lock}")); return True
+            except Exception as e: self.worker_queue.put(("log", f"ERROR eliminando lock {lock}: {e}"))
         return False
-
-    # ---------- Git UTF-8 config & commit message check ----------
     def _ensure_git_utf8_config(self, project_path):
-        steps = [
-            (["git","config","i18n.commitEncoding","utf-8"], "i18n.commitEncoding=utf-8"),
-            (["git","config","i18n.logOutputEncoding","utf-8"], "i18n.logOutputEncoding=utf-8"),
-            (["git","config","gui.encoding","utf-8"], "gui.encoding=utf-8"),
-            (["git","config","core.quotepath","false"], "core.quotepath=false"),
-        ]
-        for args, _ in steps:
+        for args in (["git","config","i18n.commitEncoding","utf-8"],
+                     ["git","config","i18n.logOutputEncoding","utf-8"],
+                     ["git","config","gui.encoding","utf-8"],
+                     ["git","config","core.quotepath","false"]):
             self._run_cmd(args, cwd=project_path)
-
     def _read_last_commit_message(self, project_path):
-        try:
-            msg = self._run_check_output(["git","log","-1","--pretty=%B"], cwd=project_path)
-            return msg.strip()
-        except Exception:
-            return ""
-
+        try: return self._run_check_output(["git","log","-1","--pretty=%B"], cwd=project_path).strip()
+        except Exception: return ""
     def _maybe_fix_last_commit_message(self, project_path):
-        last = self._read_last_commit_message(project_path)
+        last=self._read_last_commit_message(project_path)
         if not last: return
-        fixed = _unmojibake_if_needed(last)
-        if fixed != last:
+        fixed=_unmojibake_if_needed(last)
+        if fixed!=last:
             self.worker_queue.put(("log", f"Corregido mensaje de commit mojibake:\n  Antes: {last}\n  Ahora:  {fixed}"))
             self._run_cmd(["git","commit","--amend","-m", fixed], cwd=project_path)
 
-    # ---------- Pipeline principal ----------
+    # ---------- Pipeline ----------
+    def _preclean_tmp_and_sensitive(self, project_path):
+        """Borra archivos temporales y los saca del índice para que no vuelvan a colarse."""
+        for root, dirs, files in os.walk(project_path):
+            if ".git" in dirs: dirs.remove(".git")
+            for n in files:
+                if n.endswith(".tmp") or (n.startswith(".cfg_") and n.endswith(".tmp")):
+                    p=os.path.join(root,n)
+                    try: os.remove(p)
+                    except Exception: pass
+        self._untrack_list(project_path, ["config_autogit.json.tmp"])
+        self._append_gitignore_patterns(project_path, ["config_autogit.json.tmp","*.tmp",".cfg_*.tmp"])
+
+    def _paths_for_staging(self, project_path):
+        """Devuelve lista de rutas (relativas) a agregar al staging según la selección."""
+        use_sel = bool(self.cfg.get("use_custom_selection", False))
+        subs = list(self.cfg.get("selected_subfolders", []))
+        files = list(self.cfg.get("selected_files", []))
+        if not use_sel or (not subs and not files):
+            return None  # usar comportamiento por defecto: add .
+        # Validar existencia y normalizar
+        valid=[]
+        for rel in subs + files:
+            full = os.path.join(project_path, rel)
+            if os.path.exists(full):
+                valid.append(rel)
+        # Eliminar duplicados manteniendo orden
+        seen=set(); ordered=[]
+        for r in valid:
+            if r not in seen:
+                seen.add(r); ordered.append(r)
+        return ordered
+
     def _worker_pipeline(self, project_path, repo_name, commit_msg, create_readme):
         try:
             self.worker_queue.put(("stat","Verificando herramientas…"))
             if not self._exe_exists("git"):
                 self.worker_queue.put(("log","ERROR: Git no está en PATH.")); self.worker_queue.put(("done",None)); return
-            
-            git_name = self.git_user_name_var.get().strip()
-            git_mail = self.git_user_email_var.get().strip()
-            method   = self.auth_method_var.get().strip() or "https_pat"
-            gh_user  = self.github_user_var.get().strip()
 
-            if method == "https_pat":
-                pat_token = self.pat_token_var.get().strip()
-                if not pat_token:
-                    self.worker_queue.put(("log","❌ ERROR: No hay PAT token configurado"))
-                    self.worker_queue.put(("log","💡 Usa Ctrl+T para testear el token"))
-                    self.worker_queue.put(("done",None)); return
+            git_name=(self.git_user_name_var.get() or "").strip()
+            git_mail=(self.git_user_email_var.get() or "").strip()
+            method  =(self.auth_method_var.get() or "https_pat").strip()
+            gh_user =(self.github_user_var.get() or "").strip()
 
-            # 0) Re-init limpio si es primer uso
+            if method=="https_pat":
+                pat=(self.pat_token_var.get() or "").strip()
+                if not pat:
+                    self.worker_queue.put(("log","❌ ERROR: No hay PAT token configurado")); self.worker_queue.put(("done",None)); return
+
             if not self._ensure_clean_git_repo(project_path):
                 self.worker_queue.put(("done",None)); return
 
-            # 1) CONFIG identidad y branch
-            identity_steps = [
-                (["git","config","user.name", git_name], "git config user.name"),
-                (["git","config","user.email", git_mail], "git config user.email"),
-                (["git","config","core.autocrlf","true"], "git config core.autocrlf"),
-                (["git","config","core.filemode","false"], "git config core.filemode"),
-                (["git","config","core.longpaths","true"], "git config core.longpaths"),
-                (["git","config","core.safecrlf","false"], "git config core.safecrlf"),
-            ]
-            for args, label in identity_steps:
+            for args in (["git","config","user.name", git_name],
+                         ["git","config","user.email", git_mail],
+                         ["git","config","core.autocrlf","true"],
+                         ["git","config","core.filemode","false"],
+                         ["git","config","core.longpaths","true"],
+                         ["git","config","core.safecrlf","false"]):
                 if self._run_cmd(args, cwd=project_path)!=0:
-                    self.worker_queue.put(("log", f"ERROR en paso: {label}")); self.worker_queue.put(("done",None)); return
+                    self.worker_queue.put(("log","ERROR configurando git")); self.worker_queue.put(("done",None)); return
             self._ensure_git_utf8_config(project_path)
             self._run_cmd(["git","branch","-M","main"], cwd=project_path)
 
-            # 2) .gitignore + untrack + grandes
             self._ensure_gitignore(project_path)
+            self._preclean_tmp_and_sensitive(project_path)
+
             exe_name = os.path.basename(sys.executable) if getattr(sys,'frozen',False) else None
-            to_untrack = ["config.json","log.txt","config_autogit.json","log_autogit.txt"]
+            to_untrack = ["config.json","log.txt","config_autogit.json","config_autogit.json.tmp","log_autogit.txt"]
             if exe_name: to_untrack.append(exe_name)
             self._untrack_list(project_path, to_untrack)
-            large = self._scan_large_files(project_path)
+
+            large=self._scan_large_files(project_path)
             if large:
                 self._append_gitignore_patterns(project_path, large)
                 self._untrack_list(project_path, large)
 
-            # 3) README inicial si aplica
             if self.cfg.get("create_readme_if_missing", True):
-                readme_path = os.path.join(project_path, "README.md")
+                readme_path=os.path.join(project_path, "README.md")
                 if not os.path.exists(readme_path):
                     with open(readme_path,"w",encoding="utf-8") as f:
                         f.write(f"# {repo_name}\n\nProyecto {repo_name}.\n")
 
-            # 4) add & commit (respetando selección)
             self.worker_queue.put(("log","📦 Agregando archivos al staging…"))
-
-            mode = (self.sync_mode_var.get() or self.cfg.get("sync_mode","exclude")).strip()
-            paths = list(self.sync_paths)
-
-            if mode == "include":
-                # Solo incluir lo elegido. Si lista vacía, equivale a 'todo'.
-                if not self._stage_include_only(project_path, paths):
-                    if self._remove_index_lock_if_any(project_path):
-                        if not self._stage_include_only(project_path, paths):
-                            self.worker_queue.put(("log","ERROR en staging (include).")); self.worker_queue.put(("done",None)); return
+            paths = self._paths_for_staging(project_path)
+            if paths is None:
+                # comportamiento original
+                rc=self._run_cmd(["git","add","."], cwd=project_path)
             else:
-                # exclude: add . y luego quitar del índice y .gitignore
-                rc = self._run_cmd(["git","add","."], cwd=project_path)
-                if rc != 0:
-                    if self._remove_index_lock_if_any(project_path):
-                        rc = self._run_cmd(["git","add","."], cwd=project_path)
-                if rc != 0:
-                    self.worker_queue.put(("log","ERROR en git add .")); self.worker_queue.put(("done",None)); return
-                self._apply_excludes(project_path, paths, also_gitignore=True)
+                # solo lo seleccionado
+                rc = 0
+                for rel in paths:
+                    # usar rutas relativas para compatibilidad
+                    r = rel.replace("\\","/")
+                    self.worker_queue.put(("log", f"git add {r}"))
+                    rcrc = self._run_cmd(["git","add", r], cwd=project_path)
+                    if rcrc != 0: rc = rcrc
+            if rc!=0:
+                if self._remove_index_lock_if_any(project_path):
+                    if paths is None:
+                        rc=self._run_cmd(["git","add","."], cwd=project_path)
+                    else:
+                        rc = 0
+                        for r in paths:
+                            rcrc = self._run_cmd(["git","add", r], cwd=project_path)
+                            if rcrc != 0: rc = rcrc
+                if rc!=0:
+                    self.worker_queue.put(("log","ERROR en git add")); self.worker_queue.put(("done",None)); return
 
-            # Verifica si hay cambios staged
+            # commit
             si, cf = self._startupinfo_flags()
-            rc_diff_cached = subprocess.call(
-                ["git","diff","--cached","--quiet"],
-                cwd=project_path,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                env=self._git_env(project_path),
-                startupinfo=si,
-                creationflags=cf
-            )
+            rc_diff_cached = subprocess.call(["git","diff","--cached","--quiet"], cwd=project_path,
+                                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                             env=self._git_env(project_path), startupinfo=si, creationflags=cf)
             if rc_diff_cached != 0:
-                commit_msg_use = self.commit_message_var.get().strip() or "Actualización automática"
-                self.worker_queue.put(("log",f"💾 Creando commit: {commit_msg_use}"))
-                if self._run_cmd(["git","commit","-m", commit_msg_use], cwd=project_path) != 0:
+                msg = self.commit_message_var.get().strip() or "Actualización automática"
+                self.worker_queue.put(("log",f"💾 Creando commit: {msg}"))
+                if self._run_cmd(["git","commit","-m", msg], cwd=project_path)!=0:
                     self.worker_queue.put(("log","ERROR en commit.")); self.worker_queue.put(("done",None)); return
             else:
-                # Si no hay cambios y no hay ningún commit todavía, crea uno vacío
                 try:
-                    out = self._run_check_output(["git","rev-parse","--verify","HEAD"], cwd=project_path)
-                    has_head = bool(out.strip())
-                except Exception:
-                    has_head = False
+                    out=self._run_check_output(["git","rev-parse","--verify","HEAD"], cwd=project_path)
+                    has_head=bool(out.strip())
+                except Exception: has_head=False
                 if not has_head:
-                    msg = self.commit_message_var.get().strip() or "Primer commit"
+                    msg=self.commit_message_var.get().strip() or "Primer commit"
                     self.worker_queue.put(("log",f"💾 Creando commit vacío: {msg}"))
-                    if self._run_cmd(["git","commit","-m", msg, "--allow-empty"], cwd=project_path) != 0:
+                    if self._run_cmd(["git","commit","-m", msg, "--allow-empty"], cwd=project_path)!=0:
                         self.worker_queue.put(("log","ERROR en commit vacío.")); self.worker_queue.put(("done",None)); return
                 else:
                     self.worker_queue.put(("log","✅ No hay cambios para commitear."))
 
             self._maybe_fix_last_commit_message(project_path)
 
-            # 5) REMOTO
-            remote_exists = False
+            # remoto
+            remote_exists=False
+            gh_user =(self.github_user_var.get() or "").strip()
+            repo_name=(self.repo_name_var.get() or "").strip()
             if self._exe_exists("gh") and gh_user and repo_name:
-                remote_exists = self._remote_exists(gh_user, repo_name)
+                remote_exists=self._remote_exists(gh_user, repo_name)
             if not remote_exists:
                 self.worker_queue.put(("log","🌐 Repositorio remoto no existe, creando…"))
-                owner_repo = f"{gh_user}/{repo_name}"
+                owner_repo=f"{gh_user}/{repo_name}"
                 if self._exe_exists("gh"):
                     if not self._create_remote(owner_repo, project_path):
                         self.worker_queue.put(("log","⚠️ No se pudo crear el repo remoto automáticamente"))
-                        self.worker_queue.put(("log","💡 Crea el repo manualmente en GitHub.com"))
                 else:
                     self.worker_queue.put(("log","ℹ️ GitHub CLI no disponible, asumiendo repo remoto existe"))
             else:
                 self.worker_queue.put(("log","✅ Repositorio remoto existe"))
 
-            # Asegurar origin según método
-            if method == "https_pat":
+            # origin con PAT o método elegido
+            if (self.pat_token_var.get() or "").strip():
                 self._nuke_credential_helpers(project_path)
                 self._reset_origin_with_pat(project_path)
-                self.worker_queue.put(("log", "Origin (pre-push) fijado con PAT: OK"))
+                cur=self._remote_url(project_path)
+                self.worker_queue.put(("log", f"Origin (pre-push) fijado con PAT: {('x-access-token' in (cur or '')) and 'OK' or 'NO'}"))
             else:
-                origin_url = self._build_origin(method, gh_user, repo_name)
+                origin_url=self._build_origin(method, gh_user, repo_name)
                 self._ensure_origin(project_path, origin_url)
 
-            # 6) PUSH
+            # push
             self.worker_queue.put(("log","🚀 Subiendo cambios al repositorio remoto…"))
-            rc = self._git_push_with_retries(project_path, "origin", "main")
-            if rc != 0:
+            rc=self._git_push_with_retries(project_path, "origin", "main")
+            if rc!=0:
                 self.worker_queue.put(("log","❌ ERROR en push. Revisa credenciales y conexión.")); self.worker_queue.put(("done",None)); return
 
             self.worker_queue.put(("stat","✅ Pipeline completado exitosamente"))
@@ -1556,31 +1344,27 @@ class App(tk.Tk):
     # ---------- Orquestación ----------
     def _start_pipeline(self):
         if self.running: self._status("Ya hay un proceso en ejecución."); return
-        proj = self.project_path_var.get().strip()
-        repo = self.repo_name_var.get().strip()
+        proj=self.project_path_var.get().strip()
+        repo=self.repo_name_var.get().strip()
         if not proj or not os.path.isdir(proj):
             self._status("Ruta del proyecto inválida."); self._append_log("ERROR: ruta de proyecto inválida."); return
         if not repo:
             self._autodetect_repo_name(); repo=self.repo_name_var.get().strip()
             if not repo: self._status("No se pudo determinar el nombre del repo."); return
 
-        method = self.auth_method_var.get().strip() or "https_pat"
-        if method == "https_pat" and not self.pat_token_var.get().strip():
+        method=(self.auth_method_var.get() or "https_pat").strip()
+        if method=="https_pat" and not (self.pat_token_var.get() or "").strip():
             self._status("ERROR: Configura un PAT token primero (Ctrl+T para testear)")
-            messagebox.showerror("PAT Token Requerido", 
-                               "Debes configurar un Personal Access Token (PAT) de GitHub.\n\n" 
-                               "Presiona Ctrl+T para testear el token o F2 para instrucciones.")
+            messagebox.showerror("PAT Token Requerido","Debes configurar un Personal Access Token (PAT) de GitHub.\n\nPresiona Ctrl+T para testear el token o F2 para instrucciones.")
             return
 
         self.running=True; self.btn_run.config(state="disabled"); self.btn_stop.config(state="normal")
         self._status("Ejecutando pipeline…")
         self._append_log(f"Iniciando pipeline en: {proj} (repo: {repo})")
         self._cancel_autoclose()
-        t=threading.Thread(
-            target=self._worker_pipeline,
-            args=(proj,repo,self.commit_message_var.get().strip() or "Actualización automática", self.create_readme_var.get()),
-            daemon=True
-        )
+        t=threading.Thread(target=self._worker_pipeline,
+                           args=(proj,repo,self.commit_message_var.get().strip() or "Actualización automática",
+                                 self.create_readme_var.get()), daemon=True)
         t.start()
 
     def _stop_pipeline(self):
@@ -1595,7 +1379,8 @@ class App(tk.Tk):
                 elif kind=="stat": self._status(payload)
                 elif kind=="done":
                     self.running=False; self.btn_run.config(state="normal"); self.btn_stop.config(state="disabled")
-                    if self.autoclose_var.get(): self._schedule_autoclose()
+                    if self.autoclose_var.get():
+                        self._schedule_autoclose()
         except queue.Empty:
             pass
         self.after(120, self._poll_worker_queue)
@@ -1606,39 +1391,24 @@ class App(tk.Tk):
         except: pass
         log_line("Aplicación cerrada por el usuario."); self.destroy()
 
-    # ---------- Test PAT & ayuda ----------
-    def _on_auth_method_change(self):
-        method = self.auth_method_var.get()
-        self._on_str_change("auth_method", method)
-        if method == "https_pat":
-            self._status("Método: HTTPS con PAT Token (Recomendado)")
-        elif method == "ssh":
-            self._status("Método: SSH con clave privada")
-        elif method == "gh":
-            self._status("Método: GitHub CLI")
-
+    # ---------- Ayuda ----------
     def _show_pat_instructions(self):
         instructions = """🔑 CREAR PERSONAL ACCESS TOKEN (PAT) EN GITHUB:
 
-1. Ve a: https://github.com/settings/tokens
-2. Haz clic en "Generate new token" → "Generate new token (classic)"
-3. Pon un nombre descriptivo (ej: "AutoGit App")
-4. Selecciona estos permisos:
-   - ✅ repo (todo)
-   - ✅ workflow
-   - ✅ write:packages
-   - ✅ delete:packages
-5. Expiración: 90 días (recomendado)
-6. Haz clic en "Generate token"
-7. COPIA el token inmediatamente (solo se muestra una vez)
-8. Pega el token en el campo "PAT Token" de esta aplicación
+1) https://github.com/settings/tokens
+2) Generate new token (classic)
+3) Nombre descriptivo (ej: "AutoGit")
+4) Permisos: repo, workflow, write:packages, delete:packages
+5) Expiración: 90 días (recomendado)
+6) Generar y COPIAR (solo se muestra una vez)
+7) Pegar en el campo "PAT Token" de esta app
 
-⚠️ IMPORTANTE: El token es como una contraseña, guárdalo de forma segura."""
+⚠️ El token es como una contraseña. No lo publiques."""
         messagebox.showinfo("Instrucciones PAT Token", instructions)
 
     def _test_pat_token(self, *_):
-        pat_token = self.pat_token_var.get().strip()
-        github_user = self.github_user_var.get().strip()
+        pat_token = (self.pat_token_var.get() or "").strip()
+        github_user = (self.github_user_var.get() or "").strip()
         if not pat_token:
             self._append_log("❌ ERROR: No hay PAT token configurado")
             try: self.pat_status_var.set("❌ Sin token")
@@ -1670,94 +1440,24 @@ class App(tk.Tk):
             self._pat_testing = False
 
     def _test_pat_token_impl(self, callback):
-        """Prueba API /user, permisos, repo y git ls-remote contra repo real con PAT."""
-        pat_token  = self.pat_token_var.get().strip()
-        github_user = self.github_user_var.get().strip()
-        repo_name   = self.repo_name_var.get().strip() or "autogit"
-
-        import urllib.request
-        import urllib.error
-        import json as json_lib
-
-        callback("".ljust(60, "="))
+        import urllib.request, urllib.error, json as json_lib
+        pat_token  = (self.pat_token_var.get() or "").strip()
+        github_user = (self.github_user_var.get() or "").strip()
+        repo_name   = (self.repo_name_var.get() or "").strip() or "autogit"
+        callback("="*60)
         callback("🔐 Iniciando test de PAT token (inline)…")
         callback(f"Usuario: {github_user}")
         callback(f"Token: {pat_token[:8]}...")
-
-        # Test 1: /user
-        callback("1) Verificando autenticación básica a GitHub API…")
         try:
-            url = "https://api.github.com/user"
-            headers = {'Authorization': f'token {pat_token}','User-Agent': 'AutoGit-App','Accept': 'application/vnd.github.v3+json'}
-            req = urllib.request.Request(url, headers=headers)
+            url="https://api.github.com/user"
+            headers={'Authorization': f'token {pat_token}','User-Agent':'AutoGit-App','Accept':'application/vnd.github.v3+json'}
+            req=urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=10) as response:
-                data = json_lib.loads(response.read().decode())
+                data=json_lib.loads(response.read().decode())
                 callback("   ✅ Autenticación exitosa")
                 callback(f"   👤 login: {data.get('login', 'N/A')}")
-                callback(f"   📧 email: {data.get('email', 'N/A')}")
-                callback(f"   📊 RateLimit: {response.headers.get('X-RateLimit-Limit', 'N/A')}")
-        except urllib.error.HTTPError as e:
-            if e.code in (401,403):
-                callback(f"   ❌ Error HTTP {e.code} (token inválido/permiso insuf.)"); return False
-            callback(f"   ❌ Error HTTP {e.code}: {e.reason}"); return False
         except Exception as e:
-            callback(f"   ❌ Error de conexión: {str(e)}"); return False
-
-        # Test 2: listar repos
-        callback("2) Verificando permisos de repositorio (listar)…")
-        try:
-            url = "https://api.github.com/user/repos?per_page=1"
-            headers = {'Authorization': f'token {pat_token}','User-Agent': 'AutoGit-App','Accept': 'application/vnd.github.v3+json'}
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=10) as response:
-                _ = response.read()
-                callback("   ✅ Permisos de repos OK")
-        except urllib.error.HTTPError as e:
-            if e.code == 403:
-                callback("   ❌ Token sin permisos de repos (HTTP 403)"); return False
-            else:
-                callback(f"   ⚠️ Error HTTP {e.code} (puede ser normal)")
-
-        # Test 3: repo específico
-        if repo_name:
-            callback(f"3) Verificando acceso al repo '{github_user}/{repo_name}'…")
-            try:
-                url = f"https://api.github.com/repos/{github_user}/{repo_name}"
-                headers = {'Authorization': f'token {pat_token}','User-Agent': 'AutoGit-App','Accept': 'application/vnd.github.v3+json'}
-                req = urllib.request.Request(url, headers=headers)
-                with urllib.request.urlopen(req, timeout=10) as response:
-                    data = json.loads(response.read().decode())
-                    callback(f"   ✅ Accesible: {data.get('html_url', 'N/A')}")
-            except urllib.error.HTTPError as e:
-                if e.code == 404:
-                    callback("   ℹ️ Repo no existe (se puede crear automáticamente)")
-                else:
-                    callback(f"   ⚠️ Error HTTP {e.code} al acceder al repo")
-
-        # Test 4: git ls-remote con URL con PAT contra el repo real
-        callback("4) Verificando autenticación con git (ls-remote)…")
-        test_dir = os.path.join(os.path.expanduser("~"), ".autogit_test")
-        try:
-            os.makedirs(test_dir, exist_ok=True)
-            self._popen_run_any(["git", "config", "user.name", "Test User"], cwd=test_dir)
-            self._popen_run_any(["git", "config", "user.email", "test@example.com"], cwd=test_dir)
-            if not os.path.exists(os.path.join(test_dir, ".git")):
-                self._popen_run_any(["git", "init"], cwd=test_dir)
-
-            remote_url = f"https://x-access-token:{pat_token}@github.com/{github_user}/{repo_name}.git"
-            self._popen_run_any(["git", "remote", "remove", "origin"], cwd=test_dir)
-            self._popen_run_any(["git", "remote", "add", "origin", remote_url], cwd=test_dir)
-
-            rc, out = self._popen_capture_any(["git", "ls-remote", "origin"], cwd=test_dir)
-            if rc == 0:
-                callback("   ✅ Git authentication OK (ls-remote)")
-            else:
-                callback("   ❌ Git authentication failed (ls-remote)")
-                callback(f"      Salida: {out.strip() if out else 'N/A'}")
-                return False
-        except Exception as e:
-            callback(f"   ⚠️ Error en test git: {e}")
-        callback("🎉 TEST COMPLETO: El PAT parece estar configurado correctamente.")
+            callback(f"   ❌ Error autenticando: {e}"); return False
         return True
 
 # ---------- Main ----------
