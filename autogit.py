@@ -1,16 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-Git Helper GUI – v0.3.5
-Cambios 0.3.5:
-- (FIX) Diálogos de selección (subcarpetas/archivos) ahora son modales y devuelven resultado vía dlg.result,
-  evitando acceder a widgets destruidos (TclError).
-- (FIX) Se cancela el after de _poll_worker_queue en on_close para evitar "invalid command name ..._poll_worker_queue".
-- (KEEP) Selección de subcarpetas y archivos para agregar al repo (si ambas listas están vacías, usa `git add .`).
-- (KEEP) Todo lo demás permanece igual a 0.3.4.
-
-Cambios 0.3.4:
-- (FIX) Se restauran métodos de autocierre: _schedule_autoclose, _cancel_autoclose, _tick_countdown
-- Mantiene 0.3.3:
+Git Helper GUI – v0.3.6
+Cambios 0.3.6:
+- (NEW) Selector de subcarpetas y archivos para incluir en el commit/push.
+- (IMPROV) Si hay selección, el pipeline hace 'git add' solo de esas rutas; si no hay selección, hace 'git add .'
+- (FIX) Rearme garantizado del countdown al finalizar el pipeline (señal 'arm_autoclose' + fallback en 'done').
+- (FIX) Guardado continuo de geometry (posición/tamaño) con throttle y al cerrar.
+- (FIX) Poll con handle de after cancelable para evitar 'invalid command name "...poll_worker_queue"'.
+- (FIX) Diálogo de listas robusto: no accede a widgets tras destroy; devuelve el resultado de forma segura.
+- Mantiene 0.3.4:
   - Prelimpieza de *.tmp y config_autogit.json.tmp antes de add
   - GH013: purgado agresivo (config_autogit.json*, *.tmp, .cfg_*.tmp, autogit*.exe)
   - Push explícito HEAD:refs/heads/main (normal y --force)
@@ -93,8 +91,7 @@ def file_hash(path):
 
 def bump_version(v):
     try:
-        a,b,c = (list(map(int,(v.split(".")+["0","0","0"])[:3])))
-        c += 1
+        a,b,c = (list(map(int,(v.split(".")+["0","0","0"])[:3]))); c += 1
         return f"{a}.{b}.{c}"
     except: return INITIAL_VERSION
 
@@ -129,7 +126,7 @@ def _unmojibake_if_needed(s):
 DEFAULT_CONFIG = {
     "version": INITIAL_VERSION,
     "last_code_hash": "",
-    "window_geometry": "1040x760+100+100",
+    "window_geometry": "1040x720+100+100",
     "autostart": True,
     "autoclose_enabled": False,
     "autoclose_seconds": 60,
@@ -167,9 +164,9 @@ DEFAULT_CONFIG = {
 
     "clean_git_on_first_time": True,
 
-    # --- NUEVO: selección por GUI ---
-    "include_subfolders": [],   # rutas relativas a project_path
-    "include_files": []         # rutas relativas a project_path
+    # NUEVO: selección de subcarpetas/archivos
+    "selected_subfolders": [],
+    "selected_files": [],
 }
 
 GITIGNORE_LINES = [
@@ -191,113 +188,89 @@ GITIGNORE_LINES = [
     "Thumbs.db",
 ]
 
-# ---------- Diálogos seguros (modales) ----------
-class ListEditorDialog(tk.Toplevel):
-    """Editor simple de lista: agregar/quitar/ordenar. Devuelve resultado en self.result (list) o None."""
-    def __init__(self, master, title="Editar lista", initial=None, allow_dirs=False, base_dir=None):
+# ---------- Diálogo genérico para editar listas ----------
+class _ListEditorDialog(tk.Toplevel):
+    def __init__(self, master, title, items=None, mode="folders", base_dir=None):
         super().__init__(master)
-        self.title(title)
-        self.configure(bg="#101418")
-        self.result = None
-        self.allow_dirs = allow_dirs
-        self.base_dir = base_dir or app_dir()
+        self.title(title); self.configure(bg="#101418")
         self.resizable(True, True)
+        self.result_items = None  # se llenará al pulsar Aceptar
+        self._base_dir = base_dir or app_dir()
+        self._mode = mode  # "folders" o "files"
+
+        self.geometry("+{}+{}".format(master.winfo_rootx()+120, master.winfo_rooty()+120))
         self.transient(master)
         self.grab_set()
-        self._build_style(); self._build_menu(); self._build_widgets()
+
         frm = ttk.Frame(self); frm.pack(fill="both", expand=True, padx=12, pady=12)
-        self.lb = tk.Listbox(frm, height=12, bg="#0F1620", fg="#C9D1D9", selectmode="extended")
-        self.lb.grid(row=0, column=0, rowspan=6, sticky="nsew")
-        sb = ttk.Scrollbar(frm, orient="vertical", command=self.lb.yview)
-        sb.grid(row=0, column=1, rowspan=6, sticky="ns")
-        self.lb.configure(yscrollcommand=sb.set)
+        ttk.Label(frm, text=("Subcarpetas relativas" if mode=="folders" else "Archivos relativos")).pack(anchor="w")
 
-        btns = ttk.Frame(frm); btns.grid(row=0, column=2, sticky="nsw", padx=(10,0))
-        ttk.Button(btns, text="Agregar…", command=self._add).pack(fill="x", pady=2)
-        ttk.Button(btns, text="Quitar", command=self._remove).pack(fill="x", pady=2)
-        ttk.Button(btns, text="Subir ▲", command=self._up).pack(fill="x", pady=2)
-        ttk.Button(btns, text="Bajar ▼", command=self._down).pack(fill="x", pady=2)
-        ttk.Button(btns, text="Limpiar", command=self._clear).pack(fill="x", pady=2)
+        self.lb = tk.Listbox(frm, height=10, bg="#0F1620", fg="#C9D1D9", selectmode="extended")
+        self.lb.pack(fill="both", expand=True, pady=(6,6))
+        for it in (items or []):
+            self.lb.insert("end", it)
 
-        act = ttk.Frame(frm); act.grid(row=6, column=0, columnspan=3, sticky="e", pady=(10,0))
-        ttk.Button(act, text="Aceptar", command=self._ok).pack(side="right", padx=6)
-        ttk.Button(act, text="Cancelar", command=self._cancel).pack(side="right")
+        btns = ttk.Frame(frm); btns.pack(fill="x", pady=(6,0))
+        ttk.Button(btns, text="Agregar…", command=self._on_add).pack(side="left")
+        ttk.Button(btns, text="Quitar", command=self._on_remove).pack(side="left", padx=6)
+        ttk.Button(btns, text="Arriba", command=lambda: self._move_sel(-1)).pack(side="left", padx=(12,0))
+        ttk.Button(btns, text="Abajo",  command=lambda: self._move_sel(+1)).pack(side="left", padx=6)
 
-        frm.grid_rowconfigure(0, weight=1)
-        frm.grid_columnconfigure(0, weight=1)
+        act = ttk.Frame(frm); act.pack(fill="x", pady=(10,0))
+        ttk.Button(act, text="Aceptar", command=self._on_ok).pack(side="right")
+        ttk.Button(act, text="Cancelar", command=self._on_cancel).pack(side="right", padx=6)
 
-        if initial:
-            for item in initial:
-                self.lb.insert("end", item)
+        self.bind("<Delete>", lambda e: self._on_remove())
+        self.bind("<Escape>", lambda e: self._on_cancel())
+        self.protocol("WM_DELETE_WINDOW", self._on_cancel)
 
-        self.bind("<Escape>", lambda e: self._cancel())
-        self.update_idletasks()
-        if self.cfg.get("autoclose_enabled", False) and not self.running:
-            self._schedule_autoclose()
-        # Centrar sobre master
-        try:
-            x = master.winfo_rootx() + master.winfo_width()//2 - self.winfo_width()//2
-            y = master.winfo_rooty() + master.winfo_height()//2 - self.winfo_height()//2
-            self.geometry(f"+{max(0,x)}+{max(0,y)}")
-        except Exception:
-            pass
-
-    def _current_items(self):
-        return list(self.lb.get(0, "end"))
-
-    def _add(self):
-        if self.allow_dirs:
-            # Seleccionar directorios (posiblemente múltiples, uno por vez)
-            path = filedialog.askdirectory(initialdir=self.base_dir, title="Selecciona una carpeta")
+    def _on_add(self):
+        if self._mode == "folders":
+            path = filedialog.askdirectory(initialdir=self._base_dir, title="Selecciona subcarpeta")
             if path:
-                rel = os.path.relpath(path, self.base_dir)
-                if rel not in self._current_items():
+                rel = os.path.relpath(path, self._base_dir).replace("\\", "/")
+                if rel == ".": rel = ""  # raíz
+                if rel and rel not in self.items():
                     self.lb.insert("end", rel)
         else:
-            paths = filedialog.askopenfilenames(initialdir=self.base_dir, title="Selecciona archivos")
+            paths = filedialog.askopenfilenames(initialdir=self._base_dir, title="Selecciona archivos")
             for p in paths or []:
-                rel = os.path.relpath(p, self.base_dir)
-                if rel not in self._current_items():
+                rel = os.path.relpath(p, self._base_dir).replace("\\", "/")
+                if rel and rel not in self.items():
                     self.lb.insert("end", rel)
 
-    def _remove(self):
+    def _on_remove(self):
         sel = list(self.lb.curselection())
         sel.reverse()
         for i in sel:
             self.lb.delete(i)
 
-    def _up(self):
+    def _move_sel(self, delta):
         sel = list(self.lb.curselection())
         if not sel: return
+        items = list(self.items())
         for i in sel:
-            if i == 0: continue
-            text = self.lb.get(i)
-            self.lb.delete(i)
-            self.lb.insert(i-1, text)
-            self.lb.selection_set(i-1)
-
-    def _down(self):
-        sel = list(self.lb.curselection())
-        if not sel: return
-        count = self.lb.size()
-        for i in reversed(sel):
-            if i >= count-1: continue
-            text = self.lb.get(i)
-            self.lb.delete(i)
-            self.lb.insert(i+1, text)
-            self.lb.selection_set(i+1)
-
-    def _clear(self):
+            j = max(0, min(len(items)-1, i+delta))
+            items[i], items[j] = items[j], items[i]
         self.lb.delete(0, "end")
+        for it in items: self.lb.insert("end", it)
+        self.lb.selection_clear(0, "end")
+        for i in [max(0, min(len(items)-1, i+delta)) for i in sel]:
+            self.lb.selection_set(i)
 
-    def _ok(self):
-        self.result = self._current_items()
+    def items(self):
+        return list(self.lb.get(0, "end"))
+
+    def _on_ok(self):
+        # Capturar resultado ANTES de destruir widgets
+        self.result_items = self.items()
+        self.grab_release()
         self.destroy()
 
-    def _cancel(self):
-        self.result = None
+    def _on_cancel(self):
+        self.result_items = None
+        self.grab_release()
         self.destroy()
-
 
 class AboutDialog(tk.Toplevel):
     def __init__(self, master, version):
@@ -328,6 +301,9 @@ class App(tk.Tk):
             safe_write_json(CONFIG_PATH, self.cfg)
             log_line(f"Version bump por cambio de código: {self.cfg['version']}")
 
+        self._poll_job = None
+        self._geometry_save_job = None
+
         self._build_style(); self._build_menu(); self._build_widgets()
 
         if self.cfg.get("follow_exe_folder", True):
@@ -341,18 +317,23 @@ class App(tk.Tk):
         except:
             self.geometry(DEFAULT_CONFIG["window_geometry"])
 
+        # Guardado continuo de geometry con throttle
+        self.bind("<Configure>", self._on_configure_geometry)
+
         self.worker_thread = None
         self.worker_queue  = queue.Queue()
         self.running = False
         self.countdown_job = None
         self.autoclose_remaining = 0
-        self._poll_job = None  # (FIX) id del after para cancelarlo al cerrar
 
         if self.cfg.get("shortcuts_enabled", True): self._bind_shortcuts()
-        self._schedule_poll()
+        self.after(100, self._start_poll)
 
-        # (FIX) estos métodos existen ahora
-        if self.cfg.get("autoclose_enabled", False): self._schedule_autoclose()
+        # Schedule autocierre al inicio si está activo y no hay worker
+        if self.cfg.get("autoclose_enabled", False) and not self.running:
+            self._schedule_autoclose()
+
+        # Autostart
         if self.cfg.get("autostart", True): self.after(300, self._start_pipeline)
 
         log_line(f"App iniciada v{self.cfg['version']}")
@@ -408,7 +389,6 @@ class App(tk.Tk):
         e_secs.pack(side="left"); e_secs.bind("<FocusOut>", lambda e: self._on_int_change("autoclose_seconds", self.autoclose_secs_var.get()))
         e_secs.bind("<Return>",   lambda e: self._on_int_change("autoclose_seconds", self.autoclose_secs_var.get()))
 
-        # Ruta proyecto
         rowB = ttk.Frame(body); rowB.pack(fill="x", pady=(8,4))
         ttk.Label(rowB, text="Ruta del proyecto:").pack(side="left")
         self.project_path_var = tk.StringVar(value=self.cfg.get("project_path", app_dir()))
@@ -421,7 +401,6 @@ class App(tk.Tk):
                    command=self._browse_folder,
                    state="disabled" if self.cfg.get("follow_exe_folder", True) else "normal").pack(side="left", padx=(6,0))
 
-        # Repo
         rowC = ttk.Frame(body); rowC.pack(fill="x", pady=(4,4))
         ttk.Label(rowC, text="Nombre del repo (GitHub):").pack(side="left")
         self.repo_name_var = tk.StringVar(value=self.cfg.get("repo_name",""))
@@ -431,7 +410,6 @@ class App(tk.Tk):
         e_repo.bind("<Return>",   lambda e: self._on_str_change("repo_name", self.repo_name_var.get()))
         ttk.Button(rowC, text="Autodetectar", command=self._autodetect_repo_name).pack(side="left", padx=(6,0))
 
-        # Usuario git
         rowD = ttk.Frame(body); rowD.pack(fill="x", pady=(8,4))
         ttk.Label(rowD, text="Git user.name:").pack(side="left")
         self.git_user_name_var = tk.StringVar(value=self.cfg.get("git_user_name",""))
@@ -446,7 +424,6 @@ class App(tk.Tk):
         e_ue.bind("<FocusOut>", lambda e: self._on_str_change("git_user_email", self.git_user_email_var.get()))
         e_ue.bind("<Return>",   lambda e: self._on_str_change("git_user_email", self.git_user_email_var.get()))
 
-        # Auth
         rowE = ttk.LabelFrame(body, text="Autenticación GitHub (OBLIGATORIO)"); rowE.pack(fill="x", pady=(10,6))
         ttk.Label(rowE, text="Método:").grid(row=0, column=0, sticky="w", padx=6, pady=6)
         self.auth_method_var = tk.StringVar(value=self.cfg.get("auth_method","https_pat"))
@@ -499,7 +476,6 @@ class App(tk.Tk):
 
         for i in range(5): rowE.grid_columnconfigure(i, weight=1)
 
-        # Mensaje commit & README
         rowF = ttk.Frame(body); rowF.pack(fill="x", pady=(8,4))
         ttk.Label(rowF, text="Mensaje de commit:").pack(side="left")
         self.commit_message_var = tk.StringVar(value=self.cfg.get("commit_message","Actualización automática"))
@@ -512,14 +488,15 @@ class App(tk.Tk):
                         command=lambda: self._on_bool_change("create_readme_if_missing", self.create_readme_var.get())
                         ).pack(side="left", padx=(10,0))
 
-        # --- NUEVO: Controles para selección de subcarpetas y archivos ---
-        rowSel = ttk.LabelFrame(body, text="Ámbito de subida (opcional)"); rowSel.pack(fill="x", pady=(10,6))
-        ttk.Button(rowSel, text="Elegir subcarpetas…", command=self._open_subfolder_selector).pack(side="left", padx=6, pady=6)
-        ttk.Button(rowSel, text="Elegir archivos…", command=self._open_file_selector).pack(side="left", padx=6, pady=6)
-        self.sel_summary_var = tk.StringVar(value=self._selection_summary())
-        ttk.Label(rowSel, textvariable=self.sel_summary_var).pack(side="left", padx=8)
+        # --- NUEVO: selección de subcarpetas y archivos ---
+        rowSel = ttk.LabelFrame(body, text="Alcance del commit/push"); rowSel.pack(fill="x", pady=(10,6))
+        ttk.Label(rowSel, text="Si dejas vacías las listas, se usará todo el proyecto (git add .)").grid(row=0, column=0, columnspan=4, sticky="w", padx=6, pady=(4,6))
+        ttk.Button(rowSel, text="Seleccionar subcarpetas…", command=self._open_subfolder_selector).grid(row=1, column=0, sticky="w", padx=6, pady=4)
+        ttk.Button(rowSel, text="Seleccionar archivos…",    command=self._open_file_selector).grid(row=1, column=1, sticky="w", padx=6, pady=4)
+        self.sel_info_var = tk.StringVar(value=self._format_selection_summary())
+        ttk.Label(rowSel, textvariable=self.sel_info_var).grid(row=1, column=2, columnspan=2, sticky="w", padx=12)
+        for i in range(4): rowSel.grid_columnconfigure(i, weight=1)
 
-        # Botones principales
         rowG = ttk.Frame(body); rowG.pack(fill="x", pady=(12,6))
         self.btn_run  = ttk.Button(rowG, text="Ejecutar pipeline (Ctrl+R)", command=self._start_pipeline)
         self.btn_test = ttk.Button(rowG, text="Test PAT Token (Ctrl+T)", command=self._test_pat_token)
@@ -528,52 +505,18 @@ class App(tk.Tk):
         self.btn_run.pack(side="left"); self.btn_test.pack(side="left", padx=8)
         self.btn_stop.pack(side="left", padx=8); self.btn_exit.pack(side="right")
 
-        # Log
         logf = ttk.Frame(body); logf.pack(fill="both", expand=True, pady=(8,8))
         self.txt_log = tk.Text(logf, height=14, bg="#0F1620", fg="#C9D1D9", insertbackground="#C9D1D9", relief="flat", wrap="word")
         self.txt_log.pack(side="left", fill="both", expand=True)
         sb = ttk.Scrollbar(logf, orient="vertical", command=self.txt_log.yview); sb.pack(side="right", fill="y")
         self.txt_log.configure(yscrollcommand=sb.set)
 
-        # Status
         status = tk.Frame(self, bg="#0A0E12", bd=1, relief="sunken", height=24)
         status.pack(side="bottom", fill="x"); status.pack_propagate(False)
         self.status_var = tk.StringVar(value=self.cfg.get("status_text","Listo."))
         ttk.Label(status, textvariable=self.status_var, style="Status.TLabel").pack(side="left", padx=10)
         self.countdown_var = tk.StringVar(value="")
         ttk.Label(status, textvariable=self.countdown_var, style="Status.TLabel").pack(side="right", padx=10)
-
-    # ---------- NUEVO: Selectores ----------
-    def _selection_summary(self):
-        sf = self.cfg.get("include_subfolders", [])
-        ff = self.cfg.get("include_files", [])
-        if not sf and not ff: return "Sin filtros (se sube todo)."
-        parts = []
-        if sf: parts.append(f"Subcarpetas: {len(sf)}")
-        if ff: parts.append(f"Archivos: {len(ff)}")
-        return " | ".join(parts)
-
-    def _open_subfolder_selector(self):
-        base = self.project_path_var.get().strip() or app_dir()
-        lst = self.cfg.get("include_subfolders", [])
-        dlg = ListEditorDialog(self, title="Selecciona subcarpetas a incluir", initial=lst, allow_dirs=True, base_dir=base)
-        self.wait_window(dlg)  # modal
-        if dlg.result is not None:
-            self.cfg["include_subfolders"] = dlg.result
-            safe_write_json(CONFIG_PATH, self.cfg)
-            self.sel_summary_var.set(self._selection_summary())
-            self._bump_on_config_change("include_subfolders")
-
-    def _open_file_selector(self):
-        base = self.project_path_var.get().strip() or app_dir()
-        lst = self.cfg.get("include_files", [])
-        dlg = ListEditorDialog(self, title="Selecciona archivos a incluir", initial=lst, allow_dirs=False, base_dir=base)
-        self.wait_window(dlg)  # modal
-        if dlg.result is not None:
-            self.cfg["include_files"] = dlg.result
-            safe_write_json(CONFIG_PATH, self.cfg)
-            self.sel_summary_var.set(self._selection_summary())
-            self._bump_on_config_change("include_files")
 
     # ---------- Shortcuts / About ----------
     def _bind_shortcuts(self):
@@ -587,7 +530,7 @@ class App(tk.Tk):
     def _status(self, txt):
         self.status_var.set(txt); self.cfg["status_text"]=txt; safe_write_json(CONFIG_PATH, self.cfg)
 
-    # ---------- Autocierre (restaurado) ----------
+    # ---------- Autocierre ----------
     def _schedule_autoclose(self):
         self._cancel_autoclose()
         try:
@@ -640,6 +583,8 @@ class App(tk.Tk):
             self.cfg["project_path"] = self.project_path_var.get()
         safe_write_json(CONFIG_PATH, self.cfg)
         if not self.repo_name_var.get(): self._autodetect_repo_name()
+        # actualizar resumen de selección (rutas relativas a nuevo base_dir)
+        self.sel_info_var.set(self._format_selection_summary())
     def _browse_folder(self):
         if self.cfg.get("follow_exe_folder", True):
             self._status("Bloqueado por 'Usar carpeta del ejecutable'."); return
@@ -663,6 +608,18 @@ class App(tk.Tk):
         try: self.version_label.config(text=f"Versión: {new}")
         except: pass
         log_line(f"Version bump por cambio de config ({reason}): {old} -> {new}")
+
+    # Guardar geometry con throttle (evita exceso de escrituras)
+    def _on_configure_geometry(self, _event=None):
+        if self._geometry_save_job is not None:
+            try: self.after_cancel(self._geometry_save_job)
+            except: pass
+        def _save():
+            try:
+                self.cfg["window_geometry"] = self.geometry()
+                safe_write_json(CONFIG_PATH, self.cfg)
+            except Exception: pass
+        self._geometry_save_job = self.after(500, _save)
 
     # ---------- Log ----------
     def _append_log(self, txt):
@@ -1169,6 +1126,37 @@ class App(tk.Tk):
             self.worker_queue.put(("log", f"Corregido mensaje de commit mojibake:\n  Antes: {last}\n  Ahora:  {fixed}"))
             self._run_cmd(["git","commit","--amend","-m", fixed], cwd=project_path)
 
+    # ---------- Selección de subcarpetas/archivos ----------
+    def _format_selection_summary(self):
+        subs = self.cfg.get("selected_subfolders", []) or []
+        fils = self.cfg.get("selected_files", []) or []
+        return f"Subcarpetas: {len(subs)} | Archivos: {len(fils)}"
+
+    def _open_subfolder_selector(self, *_):
+        base = self.project_path_var.get().strip() or app_dir()
+        cur = self.cfg.get("selected_subfolders", []) or []
+        dlg = _ListEditorDialog(self, "Seleccionar subcarpetas a incluir", items=cur, mode="folders", base_dir=base)
+        self.wait_window(dlg)
+        if dlg.result_items is not None:
+            # Normalizar y guardar
+            cleaned = [p.strip().replace("\\", "/") for p in dlg.result_items if p.strip()]
+            self.cfg["selected_subfolders"] = cleaned
+            safe_write_json(CONFIG_PATH, self.cfg)
+            self.sel_info_var.set(self._format_selection_summary())
+            self._bump_on_config_change("selected_subfolders")
+
+    def _open_file_selector(self, *_):
+        base = self.project_path_var.get().strip() or app_dir()
+        cur = self.cfg.get("selected_files", []) or []
+        dlg = _ListEditorDialog(self, "Seleccionar archivos a incluir", items=cur, mode="files", base_dir=base)
+        self.wait_window(dlg)
+        if dlg.result_items is not None:
+            cleaned = [p.strip().replace("\\", "/") for p in dlg.result_items if p.strip()]
+            self.cfg["selected_files"] = cleaned
+            safe_write_json(CONFIG_PATH, self.cfg)
+            self.sel_info_var.set(self._format_selection_summary())
+            self._bump_on_config_change("selected_files")
+
     # ---------- Pipeline ----------
     def _preclean_tmp_and_sensitive(self, project_path):
         """Borra archivos temporales y los saca del índice para que no vuelvan a colarse."""
@@ -1183,25 +1171,41 @@ class App(tk.Tk):
         self._append_gitignore_patterns(project_path, ["config_autogit.json.tmp","*.tmp",".cfg_*.tmp"])
 
     def _git_add_scope(self, project_path):
-        """Hace git add sólo de lo seleccionado; si no hay selección, git add ."""
-        folders = self.cfg.get("include_subfolders", []) or []
-        files   = self.cfg.get("include_files", []) or []
-
-        if not folders and not files:
+        """Hace git add según la selección. Devuelve rc."""
+        subs = self.cfg.get("selected_subfolders", []) or []
+        fils = self.cfg.get("selected_files", []) or []
+        if not subs and not fils:
+            # comportamiento clásico
             return self._run_cmd(["git","add","."], cwd=project_path)
 
-        # Agregar archivos individuales
-        for rel in files:
-            rel_path = os.path.normpath(rel)
-            self._run_cmd(["git","add","--", rel_path], cwd=project_path)
+        # construir lista de rutas existentes (seguras) relativas
+        paths = []
+        for r in subs:
+            rp = os.path.join(project_path, r)
+            if os.path.isdir(rp): paths.append(r)
+        for r in fils:
+            rp = os.path.join(project_path, r)
+            if os.path.isfile(rp): paths.append(r)
 
-        # Agregar subcarpetas completas
-        for rel in folders:
-            rel_dir = os.path.normpath(rel)
-            if os.path.isdir(os.path.join(project_path, rel_dir)):
-                self._run_cmd(["git","add","--", rel_dir], cwd=project_path)
+        if not paths:
+            self.worker_queue.put(("log","⚠️ La selección no contiene rutas válidas. Usando git add ."))
+            return self._run_cmd(["git","add","."], cwd=project_path)
 
-        return 0
+        self.worker_queue.put(("log","📦 Agregando rutas seleccionadas:\n  - " + "\n  - ".join(paths)))
+        # Hacer add en lotes para evitar argumentos demasiado largos
+        rc_global = 0
+        batch = []
+        max_batch = 80
+        for pth in paths:
+            batch.append(pth)
+            if len(batch) >= max_batch:
+                rc = self._run_cmd(["git","add","--"] + batch, cwd=project_path)
+                if rc != 0: rc_global = rc
+                batch = []
+        if batch:
+            rc = self._run_cmd(["git","add","--"] + batch, cwd=project_path)
+            if rc != 0: rc_global = rc
+        return rc_global
 
     def _worker_pipeline(self, project_path, repo_name, commit_msg, create_readme):
         try:
@@ -1252,7 +1256,7 @@ class App(tk.Tk):
                     with open(readme_path,"w",encoding="utf-8") as f:
                         f.write(f"# {repo_name}\n\nProyecto {repo_name}.\n")
 
-            self.worker_queue.put(("log","📦 Agregando archivos al staging…"))
+            # ADD según selección
             rc=self._git_add_scope(project_path)
             if rc!=0:
                 if self._remove_index_lock_if_any(project_path):
@@ -1322,12 +1326,11 @@ class App(tk.Tk):
             self.worker_queue.put(("log", f"❌ ERROR pipeline: {e}"))
             self.worker_queue.put(("log", traceback.format_exc()))
         finally:
-    # Rearmar autocierre al terminar (éxito o error), lo decide el poll según la casilla
+            # Señal explícita para rearmar autocierre y evento done
             self.worker_queue.put(("arm_autoclose", None))
             self.worker_queue.put(("done", None))
 
-
-    # ---------- Orquestación ----------
+    # ---------- Orquestación / Poll ----------
     def _start_pipeline(self):
         if self.running: self._status("Ya hay un proceso en ejecución."); return
         proj=self.project_path_var.get().strip()
@@ -1357,53 +1360,47 @@ class App(tk.Tk):
         if not self.running: self._status("No hay proceso en ejecución."); return
         self.running=False; self._append_log("Solicitud de detener recibida… (termina el paso actual)")
 
-    # ---------- Poll de cola (FIX: after cancelable) ----------
-    def _poll_worker_queue(self):
-        try:
-            while True:
-                kind, payload = self.worker_queue.get_nowait()
-                if kind == "log":
-                    self._append_log(payload)
-                elif kind == "stat":
-                    self._status(payload)
-                elif kind == "arm_autoclose":
-                    # Rearma countdown si está habilitado y NO está corriendo nada
-                    if self.autoclose_var.get() and not self.running:
-                        self._schedule_autoclose()
-                        self._append_log("⏳ Auto-cierre rearmado al finalizar el proceso.")
-                elif kind == "done":
-                    self.running = False
-                    self.btn_run.config(state="normal")
-                    self.btn_stop.config(state="disabled")
-                    # por si el arm_autoclose se perdió en carrera:
-                    if self.autoclose_var.get():
-                        self._schedule_autoclose()
-        except queue.Empty:
-            pass
-        self.after(120, self._poll_worker_queue)
+    def _start_poll(self):
+        # Programar el poll y guardar el id para poder cancelarlo
+        def _poll():
+            try:
+                while True:
+                    kind, payload = self.worker_queue.get_nowait()
+                    if kind=="log":
+                        self._append_log(payload)
+                    elif kind=="stat":
+                        self._status(payload)
+                    elif kind=="arm_autoclose":
+                        if self.autoclose_var.get() and not self.running:
+                            self._schedule_autoclose()
+                            self._append_log("⏳ Auto-cierre rearmado al finalizar el proceso.")
+                    elif kind=="done":
+                        self.running=False
+                        self.btn_run.config(state="normal")
+                        self.btn_stop.config(state="disabled")
+                        # fallback por si 'arm_autoclose' se perdiera
+                        if self.autoclose_var.get():
+                            self._schedule_autoclose()
+            except queue.Empty:
+                pass
+            # Reprogramar
+            self._poll_job = self.after(120, _poll)
 
-
-    def _schedule_poll(self):
-        try:
-            if self._poll_job is not None:
-                self.after_cancel(self._poll_job)
-        except Exception:
-            pass
-        # Reprogramar sólo si la ventana sigue viva
-        if self.winfo_exists():
-            self._poll_job = self.after(120, self._poll_worker_queue)
+        # Iniciar
+        if self._poll_job is None:
+            _poll()
 
     def on_close(self):
         try:
+            # Cancelar poll y countdown seguros
             if self._poll_job is not None:
                 try: self.after_cancel(self._poll_job)
-                except Exception: pass
+                except: pass
                 self._poll_job = None
-            if self.countdown_job is not None:
-                try: self.after_cancel(self.countdown_job)
-                except Exception: pass
-                self.countdown_job = None
-            self.cfg["window_geometry"]=self.geometry(); safe_write_json(CONFIG_PATH,self.cfg)
+            self._cancel_autoclose()
+            # Guardar geometry final
+            self.cfg["window_geometry"]=self.geometry()
+            safe_write_json(CONFIG_PATH,self.cfg)
         except: pass
         log_line("Aplicación cerrada por el usuario."); self.destroy()
 
