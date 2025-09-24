@@ -549,7 +549,7 @@ class App(tk.Tk):
         if seconds is None:
             self.title(APP_NAME)
         else:
-            self.title(f"{APP_NAME} — {seconds}s")
+            self.title(f"{APP_NAME} — Cerrando en: {seconds}s")
 
     def _schedule_autoclose(self):
         self._cancel_autoclose()
@@ -559,7 +559,7 @@ class App(tk.Tk):
             secs = 60
         if secs < 1: secs = 1
         self.autoclose_remaining = secs
-        self.countdown_var.set(f"Auto-cierre: {self.autoclose_remaining} s")
+        self.countdown_var.set(f"Auto-cierre en: {self.autoclose_remaining} s")
         self._title_set_countdown(self.autoclose_remaining)
         self.countdown_job = self.after(1000, self._tick_countdown)
 
